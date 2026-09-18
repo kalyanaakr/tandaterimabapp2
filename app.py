@@ -48,6 +48,8 @@ MASTER_SHEET_ID = os.getenv("MASTER_SHEET_ID", "")
 MASTER_SHEET_WORKSHEET_NAME = os.getenv("MASTER_SHEET_WORKSHEET_NAME", "data")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")
 
 APP_TITLE = "Form Perpindahan Dokumen BAPP"
 
@@ -515,6 +517,39 @@ def _find_or_create_drive_folder(service, name: str, parent_id: str) -> str:
     return folder["id"]
 
 
+def _grant_admin_drive_access(service, folder_id: str):
+    """Berikan akses baca ke folder transaksi untuk email admin.
+
+    Ini membuat admin tetap bisa membuka PDF walaupun admin bukan orang yang
+    mengisi form. ADMIN_EMAIL sebaiknya diisi dengan akun Google admin.
+    Kalau ADMIN_EMAIL kosong, tidak ada permission tambahan yang dibuat.
+    """
+    if not ADMIN_EMAIL:
+        return
+
+    # Cek permission yang sudah ada agar tidak membuat duplikat.
+    try:
+        existing = service.permissions().list(
+            fileId=folder_id,
+            fields="permissions(id,emailAddress,type,role)"
+        ).execute().get("permissions", [])
+        if any(
+            p.get("type") == "user"
+            and p.get("emailAddress", "").lower() == ADMIN_EMAIL.lower()
+            for p in existing
+        ):
+            return
+    except Exception:
+        # Kalau pengecekan permission gagal, tetap coba membuat permission.
+        pass
+
+    service.permissions().create(
+        fileId=folder_id,
+        body={"type": "user", "role": "reader", "emailAddress": ADMIN_EMAIL},
+        sendNotificationEmail=False,
+    ).execute()
+
+
 def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
     """Upload semua file bukti ke PERPINDAHAN DOKUMEN/<tahun>/<bulan>/<id_transaksi>/."""
     if not drive_is_enabled():
@@ -524,6 +559,7 @@ def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
     tahun_id = _find_or_create_drive_folder(service, str(tanggal.year), DRIVE_ROOT_FOLDER_ID)
     bulan_id = _find_or_create_drive_folder(service, f"{tanggal.month:02d}", tahun_id)
     transaksi_folder_id = _find_or_create_drive_folder(service, id_transaksi, bulan_id)
+    _grant_admin_drive_access(service, transaksi_folder_id)
 
     for path in local_file_paths:
         media = MediaFileUpload(path, resumable=True)
@@ -678,6 +714,128 @@ def generate_pdf_ringkasan(data: dict, sig_pengirim_path: str, sig_penerima_path
 
 
 # =============================================================================
+# 8. ADMIN: RIWAYAT TRANSAKSI + AKSES PDF
+# =============================================================================
+
+def _get_admin_password():
+    """Ambil password admin dari environment atau Streamlit Secrets."""
+    if ADMIN_PASSWORD:
+        return ADMIN_PASSWORD
+    try:
+        if "ADMIN_PASSWORD" in st.secrets:
+            return str(st.secrets["ADMIN_PASSWORD"])
+    except Exception:
+        pass
+    return ""
+
+
+def _get_admin_email():
+    if ADMIN_EMAIL:
+        return ADMIN_EMAIL
+    try:
+        if "ADMIN_EMAIL" in st.secrets:
+            return str(st.secrets["ADMIN_EMAIL"])
+    except Exception:
+        pass
+    return ""
+
+
+def _admin_authenticated() -> bool:
+    return bool(st.session_state.get("admin_authenticated", False))
+
+
+def render_admin_page():
+    st.subheader("🔐 Admin — Riwayat Perpindahan")
+    st.caption(
+        "Admin dapat melihat seluruh transaksi yang tersimpan di spreadsheet "
+        "dan membuka PDF bukti, meskipun admin bukan pengisi form."
+    )
+
+    expected_password = _get_admin_password()
+    if not expected_password:
+        st.error(
+            "Akses admin belum dikonfigurasi. Tambahkan ADMIN_PASSWORD di "
+            "Streamlit Secrets (atau .env untuk lokal)."
+        )
+        return
+
+    if not _admin_authenticated():
+        with st.form("form_login_admin"):
+            password = st.text_input("Password Admin", type="password")
+            masuk = st.form_submit_button("🔓 Masuk Admin", type="primary", use_container_width=True)
+        if masuk:
+            if password == expected_password:
+                st.session_state.admin_authenticated = True
+                st.rerun()
+            else:
+                st.error("Password admin salah.")
+        return
+
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        st.success(f"Login admin aktif{(' — ' + _get_admin_email()) if _get_admin_email() else ''}")
+    with col2:
+        if st.button("Keluar", use_container_width=True):
+            st.session_state.admin_authenticated = False
+            st.rerun()
+
+    _, rows = read_rows_with_index(TAB_TRANSAKSI)
+    if not rows:
+        st.info("Belum ada transaksi perpindahan.")
+        return
+
+    # Tampilkan transaksi terbaru di atas.
+    rows = list(reversed(rows))
+    pilihan = []
+    for _, d in rows:
+        tid = d.get("id_transaksi", "")
+        if tid:
+            pilihan.append(tid)
+
+    selected_id = st.selectbox("Pilih ID Transaksi", pilihan)
+    selected = next((d for _, d in rows if d.get("id_transaksi") == selected_id), None)
+    if not selected:
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bundle", selected.get("jumlah_bundle", "0"))
+    c2.metric("BAPP", selected.get("total_bapp", "0"))
+    c3.metric("Status", selected.get("status", ""))
+
+    st.write(f"**Tanggal:** {selected.get('tanggal', '')} {selected.get('waktu', '')}")
+    st.write(f"**Pengirim:** {selected.get('nama_pengirim', '')}")
+    st.write(f"**Penerima:** {selected.get('nama_penerima', '')}")
+    st.write(f"**Perpindahan:** {selected.get('dari_lokasi', '')} → {selected.get('ke_lokasi', '')}")
+
+    drive_url = selected.get("drive_folder_url", "").strip()
+    if drive_url:
+        st.link_button("📄 Buka PDF / Folder Bukti di Google Drive", drive_url, use_container_width=True)
+        st.caption("Jika akun admin belum memiliki izin Drive, pastikan ADMIN_EMAIL berisi email Google admin dan transaksi dibuat ulang setelah konfigurasi tersebut aktif.")
+    else:
+        st.warning(
+            "PDF untuk transaksi ini belum memiliki link Google Drive. "
+            "Pastikan DRIVE_ROOT_FOLDER_ID sudah diisi agar bukti PDF tersimpan permanen dan dapat diakses admin."
+        )
+
+    st.divider()
+    st.write("**Daftar transaksi**")
+    table_rows = []
+    for _, d in rows:
+        table_rows.append({
+            "ID Transaksi": d.get("id_transaksi", ""),
+            "Tanggal": d.get("tanggal", ""),
+            "Pengirim": d.get("nama_pengirim", ""),
+            "Penerima": d.get("nama_penerima", ""),
+            "Dari": d.get("dari_lokasi", ""),
+            "Ke": d.get("ke_lokasi", ""),
+            "Bundle": d.get("jumlah_bundle", ""),
+            "BAPP": d.get("total_bapp", ""),
+            "Status": d.get("status", ""),
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
 # 8. STATE WIZARD
 # =============================================================================
 
@@ -691,6 +849,10 @@ def init_wizard_state():
         "data_nama_penerima": "",
         "last_result": None,
         "canvas_version": 0,
+        "ttd_pengirim_image": None,
+        "ttd_penerima_image": None,
+        "admin_authenticated": False,
+        "show_admin": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -701,6 +863,8 @@ def reset_wizard():
     st.session_state.wizard_step = "form"
     st.session_state.selected_bundles = []
     st.session_state.last_result = None
+    st.session_state.ttd_pengirim_image = None
+    st.session_state.ttd_penerima_image = None
     # Ganti "versi" kanvas tanda tangan supaya widget-nya dibuat ulang dari
     # kosong untuk transaksi berikutnya (bukan melanjutkan goresan lama).
     st.session_state.canvas_version = st.session_state.get("canvas_version", 0) + 1
@@ -875,13 +1039,44 @@ def render_step_summary():
             key=f"canvas_penerima_{versi}",
         )
 
-    # Jangan akses .image_data secara langsung. Library drawable-canvas dapat
-    # melempar RuntimeError saat image_data_url belum tersedia.
-    ttd_pengirim_image = _ambil_image_data_canvas(canvas_pengirim)
-    ttd_penerima_image = _ambil_image_data_canvas(canvas_penerima)
+    # Drawable canvas dapat mengembalikan image_data=None pada rerun tertentu
+    # (terutama di Streamlit Cloud). Karena itu tanda tangan yang sudah berhasil
+    # diterima dari browser disimpan di session_state. Ini membuat tombol Submit
+    # tetap aktif walaupun rerun berikutnya tidak lagi mengirim image_data.
+    current_pengirim = _ambil_image_data_canvas(canvas_pengirim)
+    current_penerima = _ambil_image_data_canvas(canvas_penerima)
+
+    if current_pengirim is not None:
+        if _ada_goresan_ttd(current_pengirim):
+            st.session_state.ttd_pengirim_image = current_pengirim
+        else:
+            # Kanvas benar-benar kosong (misalnya tombol hapus ditekan).
+            st.session_state.ttd_pengirim_image = None
+
+    if current_penerima is not None:
+        if _ada_goresan_ttd(current_penerima):
+            st.session_state.ttd_penerima_image = current_penerima
+        else:
+            st.session_state.ttd_penerima_image = None
+
+    ttd_pengirim_image = st.session_state.get("ttd_pengirim_image")
+    ttd_penerima_image = st.session_state.get("ttd_penerima_image")
 
     ttd_pengirim_ok = _ada_goresan_ttd(ttd_pengirim_image)
     ttd_penerima_ok = _ada_goresan_ttd(ttd_penerima_image)
+
+    status_col1, status_col2 = st.columns(2)
+    with status_col1:
+        if ttd_pengirim_ok:
+            st.success("✓ TTD Pengirim terbaca")
+        else:
+            st.warning("TTD Pengirim belum terbaca")
+    with status_col2:
+        if ttd_penerima_ok:
+            st.success("✓ TTD Penerima terbaca")
+        else:
+            st.warning("TTD Penerima belum terbaca")
+
     if not (ttd_pengirim_ok and ttd_penerima_ok):
         st.caption("Tanda tangan Pengirim dan Penerima wajib diisi sebelum submit.")
 
@@ -1003,6 +1198,9 @@ with top_col1:
 with top_col2:
     with st.popover("⚙️"):
         st.caption("Pengaturan")
+        if st.button("🔐 Admin / Riwayat PDF", use_container_width=True):
+            st.session_state.show_admin = True
+            st.rerun()
         st.write(f"Master BAPP: `{MASTER_SHEET_ID[:12]}...`" if MASTER_SHEET_ID else "Master BAPP: belum diatur")
         if st.button("🔄 Sinkronisasi Data"):
             try:
@@ -1017,9 +1215,15 @@ with top_col2:
             except Exception as e:
                 st.error(f"Sinkronisasi gagal: {e}")
 
-STEP_RENDERERS = {
-    "form": render_step_form,
-    "summary": render_step_summary,
-    "berhasil": render_step_berhasil,
-}
-STEP_RENDERERS[st.session_state.wizard_step]()
+if st.session_state.get("show_admin", False):
+    if st.button("⬅️ Kembali ke Form", use_container_width=True):
+        st.session_state.show_admin = False
+        st.rerun()
+    render_admin_page()
+else:
+    STEP_RENDERERS = {
+        "form": render_step_form,
+        "summary": render_step_summary,
+        "berhasil": render_step_berhasil,
+    }
+    STEP_RENDERERS[st.session_state.wizard_step]()
