@@ -1260,10 +1260,22 @@ def render_step_form():
 
 def _ringkasan_per_direktorat():
     by_direktorat = {}
+
     for b in st.session_state.selected_bundles:
-        agg = by_direktorat.setdefault(b["direktorat"], {"jumlah_bundle": 0, "total_bapp": 0})
-    agg["jumlah_bundle"] += 1
-    agg["total_bapp"] += b["jumlah_bapp"]
+        direktorat = b.get("direktorat", "")
+        jumlah_bapp = int(b.get("jumlah_bapp") or 0)
+
+        agg = by_direktorat.setdefault(
+            direktorat,
+            {
+                "jumlah_bundle": 0,
+                "total_bapp": 0,
+            }
+        )
+
+        agg["jumlah_bundle"] += 1
+        agg["total_bapp"] += jumlah_bapp
+
     return by_direktorat
 def render_step_summary():
     st.subheader("Ringkasan Perpindahan")
@@ -1480,25 +1492,6 @@ def render_step_berhasil():
     st.divider()
     for direktorat, agg in sorted(r["by_direktorat"].items()):
         st.write(f"**{direktorat}** — {agg['jumlah_bundle']} Bundle | {agg['total_bapp']} BAPP")
-
-    st.divider()
-    st.subheader("Detail Bundle")
-    detail_rows = []
-    for no, bundle in enumerate(r.get("detail_bundle", []), start=1):
-        detail_rows.append({
-            "No": no,
-            "Nomor Bundle": bundle.get("nomor_bundle", ""),
-            "Direktorat": bundle.get("direktorat", ""),
-            "Jumlah BAPP": bundle.get("jumlah_bapp", 0),
-        })
-    if detail_rows:
-        st.dataframe(
-            pd.DataFrame(detail_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.caption("Detail bundle tidak tersedia untuk transaksi ini.")
 
     st.divider()
     st.metric("TOTAL", f"{r['total_bundle']} Bundle / {r['total_bapp']} BAPP")
