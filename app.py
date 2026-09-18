@@ -43,13 +43,29 @@ from dotenv import load_dotenv
 # =============================================================================
 load_dotenv()
 
-DB_SHEET_ID = os.getenv("DB_SHEET_ID", "")
-MASTER_SHEET_ID = os.getenv("MASTER_SHEET_ID", "")
-MASTER_SHEET_WORKSHEET_NAME = os.getenv("MASTER_SHEET_WORKSHEET_NAME", "data")
-GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
-DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")
+# Streamlit Cloud memakai st.secrets, sedangkan lokal memakai .env.
+# Nilai dari Secrets diprioritaskan jika tersedia.
+def _setting(name: str, default: str = "") -> str:
+    value = os.getenv(name, default)
+    try:
+        secret_value = st.secrets.get(name, None)
+        if secret_value is not None:
+            # Jangan menganggap string kosong sebagai konfigurasi aktif.
+            secret_value = str(secret_value).strip()
+            if secret_value:
+                value = secret_value
+    except Exception:
+        pass
+    return str(value or "").strip()
+
+
+DB_SHEET_ID = _setting("DB_SHEET_ID")
+MASTER_SHEET_ID = _setting("MASTER_SHEET_ID")
+MASTER_SHEET_WORKSHEET_NAME = _setting("MASTER_SHEET_WORKSHEET_NAME", "data")
+GOOGLE_SERVICE_ACCOUNT_FILE = _setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+DRIVE_ROOT_FOLDER_ID = _setting("DRIVE_ROOT_FOLDER_ID")
+ADMIN_PASSWORD = _setting("ADMIN_PASSWORD")
+ADMIN_EMAIL = _setting("ADMIN_EMAIL")
 
 APP_TITLE = "Form Perpindahan Dokumen BAPP"
 
@@ -718,26 +734,11 @@ def generate_pdf_ringkasan(data: dict, sig_pengirim_path: str, sig_penerima_path
 # =============================================================================
 
 def _get_admin_password():
-    """Ambil password admin dari environment atau Streamlit Secrets."""
-    if ADMIN_PASSWORD:
-        return ADMIN_PASSWORD
-    try:
-        if "ADMIN_PASSWORD" in st.secrets:
-            return str(st.secrets["ADMIN_PASSWORD"])
-    except Exception:
-        pass
-    return ""
+    return ADMIN_PASSWORD
 
 
 def _get_admin_email():
-    if ADMIN_EMAIL:
-        return ADMIN_EMAIL
-    try:
-        if "ADMIN_EMAIL" in st.secrets:
-            return str(st.secrets["ADMIN_EMAIL"])
-    except Exception:
-        pass
-    return ""
+    return ADMIN_EMAIL
 
 
 def _admin_authenticated() -> bool:
