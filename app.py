@@ -258,7 +258,10 @@ def get_client():
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet():
     return get_client().open_by_key(DB_SHEET_ID)
-    _WORKSHEET_CACHE = {}
+
+
+_WORKSHEET_CACHE = {}
+
 def get_or_create_worksheet(tab_name: str):
     """Ambil worksheet; kalau belum ada, buat otomatis + isi baris header.
     Objek worksheet disimpan di cache proses supaya tidak perlu tanya ulang
@@ -273,7 +276,7 @@ def get_or_create_worksheet(tab_name: str):
         ws = sh.worksheet(tab_name)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab_name, rows=2000, cols=len(TAB_HEADERS[tab_name]) + 2)
-    ws.append_row(TAB_HEADERS[tab_name], value_input_option="USER_ENTERED")
+        ws.append_row(TAB_HEADERS[tab_name], value_input_option="USER_ENTERED")
     _WORKSHEET_CACHE[tab_name] = ws
     return ws
 def read_rows_with_index(tab_name: str):
@@ -289,7 +292,7 @@ def read_rows_with_index(tab_name: str):
     rows = []
     for i, raw in enumerate(values[1:], start=2):
         d = {header[j]: (raw[j] if j < len(raw) else "") for j in range(len(header))}
-    rows.append((i, d))
+        rows.append((i, d))
     return header, rows
 def read_records(tab_name: str) -> list:
     _, rows = read_rows_with_index(tab_name)
@@ -310,8 +313,8 @@ def batch_update_cells(tab_name: str, cell_updates: list):
     data = []
     for row_number, col_name, value in cell_updates:
         col_idx = header.index(col_name) + 1
-    a1 = rowcol_to_a1(row_number, col_idx)
-    data.append({"range": a1, "values": [[value]]})
+        a1 = rowcol_to_a1(row_number, col_idx)
+        data.append({"range": a1, "values": [[value]]})
     ws.batch_update(data, value_input_option="USER_ENTERED")
 
 # =============================================================================
@@ -536,10 +539,10 @@ def update_transaksi_drive_info(id_transaksi, drive_folder_id, drive_folder_url)
     for row_no, d in rows:
         if d.get("id_transaksi") == id_transaksi:
             batch_update_cells(TAB_TRANSAKSI, [
-    (row_no, "drive_folder_id", drive_folder_id),
-    (row_no, "drive_folder_url", drive_folder_url),
-    ])
-    return True
+                (row_no, "drive_folder_id", drive_folder_id),
+                (row_no, "drive_folder_url", drive_folder_url),
+            ])
+            return True
     return False
 
 # =============================================================================
