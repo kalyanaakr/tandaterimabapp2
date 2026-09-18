@@ -425,9 +425,9 @@ def _row_to_bundle(d: dict) -> dict:
     }
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _read_master_bundle_cached():
-    """Dicache 20 detik supaya dropdown Direktorat & pencarian digit tidak
+    """Dicache 120 detik supaya dropdown Direktorat & pencarian digit tidak
     menarik ulang seluruh tab master_bundle dari Google Sheets di SETIAP
     interaksi (tiap klik/ketik di Streamlit menjalankan ulang seluruh
     script). Cache ini dibersihkan otomatis setiap habis Sinkronisasi Data
@@ -1007,13 +1007,50 @@ def reset_wizard():
     st.session_state.canvas_version = st.session_state.get("canvas_version", 0) + 1
     st.session_state.data_nama_pengirim = ""
     st.session_state.data_nama_penerima = ""
-    for k in ("widget_nama_pengirim", "widget_nama_penerima", "digit_search"):
-        st.session_state.pop(k, None)
+    for k in list(st.session_state.keys()):
+        if k in ("widget_nama_pengirim", "widget_nama_penerima", "digit_search", "hasil_cari_bundle") or str(k).startswith("bundle_picker_"):
+            st.session_state.pop(k, None)
 
 
 # =============================================================================
 # 9. HALAMAN / STEP WIZARD
 # =============================================================================
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _get_recent_transactions(limit: int = 5):
+    """Ambil sedikit riwayat transaksi terakhir untuk ditampilkan di Form.
+    Cache mencegah Google Sheets dibaca ulang setiap kali pengguna mengetik.
+    Riwayat tetap tersedia setelah browser di-refresh karena sumbernya adalah
+    spreadsheet, bukan session_state.
+    """
+    try:
+        _, rows = read_rows_with_index(TAB_TRANSAKSI)
+        rows = list(reversed(rows))
+        return [d for _, d in rows[:limit]]
+    except Exception:
+        return []
+
+
+def _render_riwayat_terakhir():
+    recent = _get_recent_transactions(5)
+    with st.expander("🕘 Riwayat perpindahan terakhir", expanded=False):
+        if not recent:
+            st.caption("Belum ada riwayat perpindahan.")
+            return
+        table = []
+        for d in recent:
+            table.append({
+                "ID": d.get("id_transaksi", ""),
+                "Waktu": f"{d.get('tanggal', '')} {d.get('waktu', '')}".strip(),
+                "Pengirim": d.get("nama_pengirim", ""),
+                "Penerima": d.get("nama_penerima", ""),
+                "Perpindahan": f"{d.get('dari_lokasi', '')} → {d.get('ke_lokasi', '')}",
+                "Bundle": d.get("jumlah_bundle", ""),
+                "BAPP": d.get("total_bapp", ""),
+                "Status": d.get("status", ""),
+            })
+        st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+
 
 def render_step_form():
     # PENTING: widget di Streamlit cuma "hidup" selama fungsi yang membuatnya
@@ -1052,47 +1089,115 @@ def render_step_form():
 
     st.divider()
     st.subheader("Pilih Bundle")
+    refresh_col1, refresh_col2 = st.columns([5, 1])
+    with refresh_col2:
+        if st.button("↻", help="Muat ulang data bundle dari Google Sheets", use_container_width=True):
+            _read_master_bundle_cached.clear()
+            _get_recent_transactions.clear()
+            st.rerun()
 
     direktorat_options = ["Semua Direktorat"] + get_direktorat_options(dari_lokasi)
+    # Kalau lokasi/Direktorat berubah, jangan biarkan nilai filter lama yang
+    # sudah tidak ada di options membuat widget rancu atau menghambat lanjut.
+    if st.session_state.get("direktorat_filter") not in direktorat_options:
+        st.session_state.direktorat_filter = "Semua Direktorat"
     direktorat_filter = st.selectbox("Direktorat", options=direktorat_options, key="direktorat_filter")
 
-    digit_input = st.text_input(
-        "Cari Nomor Bundle (ketik beberapa digit terakhir)",
-        key="digit_search", placeholder="contoh: 125",
-    )
-
+    # ------------------------------------------------------------------
+    # PILIH BUNDLE DARI DAFTAR
+    # ------------------------------------------------------------------
+    # Tidak perlu mengetik nomor bundle satu per satu. Data master sudah
+    # dicache, jadi daftar ini hanya membaca cache yang sama dengan pencarian.
     sudah_dipilih = {b["nomor_bundle"] for b in st.session_state.selected_bundles}
 
-    if digit_input.strip():
-        hasil = cari_bundle_by_digit(dari_lokasi, direktorat_filter, digit_input, sudah_dipilih)
-        if not hasil:
-            st.info("Bundle tidak ditemukan. Cek lagi lokasi/direktorat/digit yang diketik.")
-        elif len(hasil) == 1:
-            b = hasil[0]
-            st.write(f"**{b['nomor_bundle']}** — {b['direktorat']} — {b['jumlah_bapp']} BAPP")
-            if st.button("+ Tambahkan", key=f"tambah_{b['nomor_bundle']}", type="primary"):
-                st.session_state.selected_bundles.append({
-                    "nomor_bundle": b["nomor_bundle"], "direktorat": b["direktorat"], "jumlah_bapp": b["jumlah_bapp"],
-                })
-                st.session_state.pop("digit_search", None)
-                st.rerun()
-        else:
-            hasil = hasil[:20]
-            st.write(f"Ditemukan {len(hasil)} bundle, pilih salah satu:")
-            opsi = {f"{b['nomor_bundle']} — {b['direktorat']} — {b['jumlah_bapp']} BAPP": b for b in hasil}
-            pilihan_label = st.radio(
-                "Bundle", options=list(opsi.keys()), key="radio_pilihan_bundle", label_visibility="collapsed"
-            )
-            if st.button("+ Tambahkan", key="tambah_dari_radio", type="primary"):
-                b = opsi[pilihan_label]
-                st.session_state.selected_bundles.append({
-                    "nomor_bundle": b["nomor_bundle"], "direktorat": b["direktorat"], "jumlah_bapp": b["jumlah_bapp"],
-                })
-                st.session_state.pop("digit_search", None)
-                st.session_state.pop("radio_pilihan_bundle", None)
-                st.rerun()
+    semua_bundle = get_bundles_by_lokasi(dari_lokasi)
+    if direktorat_filter != "Semua Direktorat":
+        semua_bundle = [
+            b for b in semua_bundle
+            if b["direktorat"] == direktorat_filter
+        ]
+
+    bundle_tersedia = [
+        b for b in semua_bundle
+        if b["nomor_bundle"] not in sudah_dipilih
+    ]
+
+    if not bundle_tersedia:
+        st.info("Tidak ada bundle yang tersedia untuk lokasi/direktorat ini.")
     else:
-        st.caption("Ketik minimal 1-2 digit terakhir nomor bundle untuk mencari.")
+        st.caption(
+            f"{len(bundle_tersedia):,} bundle tersedia. "
+            "Pilih satu atau beberapa bundle sekaligus dari daftar di bawah."
+        )
+
+        opsi_bundle = {
+            f"{b['nomor_bundle']} — {b['direktorat']} — {b['jumlah_bapp']} BAPP": b
+            for b in bundle_tersedia
+        }
+
+        picker_key = f"bundle_picker_{dari_lokasi}_{direktorat_filter}"
+        pilihan_labels = st.multiselect(
+            "Daftar Bundle yang Mau Dipindahkan",
+            options=list(opsi_bundle.keys()),
+            key=picker_key,
+            placeholder="Klik di sini untuk memilih bundle...",
+        )
+
+        if pilihan_labels and st.button(
+            f"+ Tambahkan {len(pilihan_labels)} Bundle ke Daftar",
+            key="tambah_bundle_dari_daftar",
+            type="primary",
+            use_container_width=True,
+        ):
+            existing = {b["nomor_bundle"] for b in st.session_state.selected_bundles}
+            for label in pilihan_labels:
+                b = opsi_bundle[label]
+                if b["nomor_bundle"] not in existing:
+                    st.session_state.selected_bundles.append({
+                        "nomor_bundle": b["nomor_bundle"],
+                        "direktorat": b["direktorat"],
+                        "jumlah_bapp": b["jumlah_bapp"],
+                    })
+                    existing.add(b["nomor_bundle"])
+            st.session_state.pop(picker_key, None)
+            st.rerun()
+        elif not pilihan_labels:
+            st.caption("Belum ada bundle dari daftar yang dipilih.")
+
+    # Pencarian digit tetap tersedia sebagai opsi cepat untuk bundle tertentu.
+    with st.expander("🔎 Cari berdasarkan nomor bundle (opsional)"):
+        digit_input = st.text_input(
+            "Ketik beberapa digit terakhir",
+            key="digit_search",
+            placeholder="contoh: 125",
+        )
+        if digit_input.strip():
+            hasil = cari_bundle_by_digit(
+                dari_lokasi, direktorat_filter, digit_input, sudah_dipilih
+            )
+            if not hasil:
+                st.info("Bundle tidak ditemukan.")
+            else:
+                opsi_cari = {
+                    f"{b['nomor_bundle']} — {b['direktorat']} — {b['jumlah_bapp']} BAPP": b
+                    for b in hasil[:50]
+                }
+                pilihan_cari = st.selectbox(
+                    "Hasil pencarian",
+                    options=list(opsi_cari.keys()),
+                    key="hasil_cari_bundle",
+                )
+                if st.button("+ Tambahkan Hasil Pencarian", key="tambah_hasil_cari"):
+                    b = opsi_cari[pilihan_cari]
+                    if b["nomor_bundle"] not in {x["nomor_bundle"] for x in st.session_state.selected_bundles}:
+                        st.session_state.selected_bundles.append({
+                            "nomor_bundle": b["nomor_bundle"],
+                            "direktorat": b["direktorat"],
+                            "jumlah_bapp": b["jumlah_bapp"],
+                        })
+                    st.session_state.pop("digit_search", None)
+                    st.session_state.pop("hasil_cari_bundle", None)
+                    st.rerun()
 
     st.divider()
     st.subheader("Bundle Terpilih")
@@ -1113,6 +1218,9 @@ def render_step_form():
                     st.session_state.selected_bundles = [
                         x for x in st.session_state.selected_bundles if x["nomor_bundle"] != b["nomor_bundle"]
                     ]
+                    for k in list(st.session_state.keys()):
+                        if str(k).startswith("bundle_picker_"):
+                            st.session_state.pop(k, None)
                     st.rerun()
 
         total_bundle = len(st.session_state.selected_bundles)
@@ -1120,10 +1228,21 @@ def render_step_form():
         st.metric("Total Dipilih", f"{total_bundle} Bundle / {total_bapp} BAPP")
 
     st.divider()
-    bisa_lanjut = bool(nama_pengirim.strip()) and bool(nama_penerima.strip()) and len(st.session_state.selected_bundles) > 0
+    bisa_lanjut = (
+        bool(nama_pengirim.strip())
+        and bool(nama_penerima.strip())
+        and len(st.session_state.selected_bundles) > 0
+    )
+    if not bisa_lanjut:
+        st.caption("Isi Nama Pengirim, Nama Penerima, dan pilih minimal 1 bundle untuk melanjutkan.")
     if st.button("Lanjut ke Summary ➡️", type="primary", disabled=not bisa_lanjut, use_container_width=True):
+        # Filter pencarian boleh masih terisi. Filter hanya untuk mencari
+        # bundle; filter tidak boleh menghalangi perpindahan ke Summary.
+        st.session_state.submit_error = None
         st.session_state.wizard_step = "summary"
         st.rerun()
+
+    _render_riwayat_terakhir()
 
 
 def _ringkasan_per_direktorat():
