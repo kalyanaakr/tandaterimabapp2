@@ -482,7 +482,8 @@ def generate_id_transaksi(tanggal: date) -> str:
 
 
 def create_transaksi_perpindahan(dari_lokasi, ke_lokasi, nama_pengirim, nama_penerima,
-                                  nomor_bundle_list, drive_folder_id=None, drive_folder_url=None):
+                                  nomor_bundle_list, drive_folder_id=None, drive_folder_url=None,
+                                  id_transaksi_override=None):
     """Catat satu transaksi perpindahan untuk banyak bundle (bisa lintas
     direktorat) sekaligus. Selalu membaca ulang lokasi PALING BARU tepat
     sebelum menulis, supaya tidak menimpa perpindahan yang baru saja
@@ -514,7 +515,14 @@ def create_transaksi_perpindahan(dari_lokasi, ke_lokasi, nama_pengirim, nama_pen
     if not valid:
         raise ValueError("Tidak ada bundle valid untuk dipindahkan.")
 
-    id_transaksi = generate_id_transaksi(now.date())
+    id_transaksi = id_transaksi_override or generate_id_transaksi(now.date())
+
+    # Cegah ID transaksi yang sama tercatat dua kali. Ini terutama berguna
+    # karena pada alur baru PDF di-upload lebih dulu, lalu transaksi baru
+    # benar-benar di-commit ke database.
+    if any(r.get("id_transaksi") == id_transaksi for r in read_records(TAB_TRANSAKSI)):
+        raise ValueError(f"ID transaksi {id_transaksi} sudah digunakan. Silakan submit ulang.")
+
     total_bapp = sum(v[3] for v in valid)
 
     append_row(TAB_TRANSAKSI, [
@@ -975,6 +983,7 @@ def init_wizard_state():
         "data_nama_pengirim": "",
         "data_nama_penerima": "",
         "last_result": None,
+        "submit_error": None,
         "canvas_version": 0,
         "ttd_pengirim_image": None,
         "ttd_penerima_image": None,
@@ -990,6 +999,7 @@ def reset_wizard():
     st.session_state.wizard_step = "form"
     st.session_state.selected_bundles = []
     st.session_state.last_result = None
+    st.session_state.submit_error = None
     st.session_state.ttd_pengirim_image = None
     st.session_state.ttd_penerima_image = None
     # Ganti "versi" kanvas tanda tangan supaya widget-nya dibuat ulang dari
@@ -1209,6 +1219,10 @@ def render_step_summary():
     if not (ttd_pengirim_ok and ttd_penerima_ok):
         st.caption("Tanda tangan Pengirim dan Penerima wajib diisi sebelum submit.")
 
+    if st.session_state.get("submit_error"):
+        st.error(st.session_state.submit_error)
+        st.caption("Tidak ada bundle yang dipindahkan. Periksa pilihan lalu coba Submit lagi.")
+
     st.divider()
     colA, colB = st.columns(2)
     with colA:
@@ -1220,19 +1234,32 @@ def render_step_summary():
             "✅ Submit Perpindahan", type="primary", use_container_width=True,
             disabled=not (ttd_pengirim_ok and ttd_penerima_ok),
         ):
+            # Penting: JANGAN mengubah lokasi bundle di sini sebelum PDF
+            # berhasil dibuat/upload. Pada versi lama, database dipindahkan
+            # lebih dulu sehingga kegagalan upload bisa membuat status sudah
+            # berpindah walaupun proses terlihat gagal.
+            st.session_state.submit_error = None
             dari_lokasi = st.session_state.data_dari_lokasi
             ke_lokasi = ALUR_LOKASI[dari_lokasi]
             nomor_bundle_list = [b["nomor_bundle"] for b in st.session_state.selected_bundles]
 
             try:
-                id_transaksi, n_bundle, n_bapp = create_transaksi_perpindahan(
-                    dari_lokasi=dari_lokasi, ke_lokasi=ke_lokasi,
-                    nama_pengirim=st.session_state.data_nama_pengirim.strip(),
-                    nama_penerima=st.session_state.data_nama_penerima.strip(),
-                    nomor_bundle_list=nomor_bundle_list,
-                )
+                # 1) Validasi kondisi TERBARU dan siapkan ID transaksi, tanpa
+                #    mengubah spreadsheet/master bundle terlebih dahulu.
+                now = datetime.now()
+                _, latest_rows = read_rows_with_index(TAB_MASTER_BUNDLE)
+                by_nomor = {d.get("nomor_bundle"): d for _, d in latest_rows}
+                invalid = [
+                    nb for nb in nomor_bundle_list
+                    if nb not in by_nomor or by_nomor[nb].get("lokasi_saat_ini") != dari_lokasi
+                ]
+                if invalid:
+                    raise ValueError(
+                        "Perpindahan dibatalkan. Bundle berikut sudah tidak berada di "
+                        f"{dari_lokasi}: {', '.join(invalid)}. Kembali ke Form untuk memeriksa ulang."
+                    )
 
-                waktu = datetime.now()
+                id_transaksi = generate_id_transaksi(now.date())
                 hasil = {
                     "id_transaksi": id_transaksi,
                     "nama_pengirim": st.session_state.data_nama_pengirim,
@@ -1240,48 +1267,70 @@ def render_step_summary():
                     "dari_lokasi": dari_lokasi,
                     "ke_lokasi": ke_lokasi,
                     "by_direktorat": _ringkasan_per_direktorat(),
-                    "total_bundle": n_bundle,
-                    "total_bapp": n_bapp,
-                    "waktu": waktu,
+                    "total_bundle": len(nomor_bundle_list),
+                    "total_bapp": sum(int(by_nomor[nb].get("jumlah_bapp") or 0) for nb in nomor_bundle_list),
+                    "waktu": now,
                 }
 
                 tmp_dir = tempfile.mkdtemp(prefix="ttd_")
                 sig_pengirim_path = os.path.join(tmp_dir, "ttd_pengirim.png")
                 sig_penerima_path = os.path.join(tmp_dir, "ttd_penerima.png")
-                # Gunakan image_data yang sudah dibaca aman di atas, bukan
-                # mengakses canvas.image_data lagi saat proses submit.
                 _simpan_ttd_png(ttd_pengirim_image, sig_pengirim_path)
                 _simpan_ttd_png(ttd_penerima_image, sig_penerima_path)
 
+                # 2) Buat PDF dulu.
                 pdf_bytes = generate_pdf_ringkasan(hasil, sig_pengirim_path, sig_penerima_path)
                 hasil["pdf_bytes"] = pdf_bytes
 
+                # 3) Upload PDF dulu. Kalau gagal, MASTER BAPP belum disentuh.
+                drive_folder_id = None
                 drive_folder_url = None
                 if drive_is_enabled():
-                    try:
-                        pdf_path = os.path.join(tmp_dir, f"{id_transaksi}.pdf")
-                        with open(pdf_path, "wb") as f:
-                            f.write(pdf_bytes)
-                        fid, furl = upload_bukti_transaksi(id_transaksi, waktu.date(), [pdf_path])
-                        update_transaksi_drive_info(id_transaksi, fid, furl)
-                        drive_folder_url = furl
-                    except Exception as drive_err:
-                        st.warning(f"Transaksi tersimpan, tapi upload PDF ke Drive gagal: {drive_err}")
+                    pdf_path = os.path.join(tmp_dir, f"{id_transaksi}.pdf")
+                    with open(pdf_path, "wb") as f:
+                        f.write(pdf_bytes)
+                    drive_folder_id, drive_folder_url = upload_bukti_transaksi(
+                        id_transaksi, now.date(), [pdf_path]
+                    )
+
+                # 4) BARU setelah PDF aman, commit transaksi + pindahkan
+                #    lokasi bundle. Fungsi ini juga membaca lokasi terbaru lagi
+                #    untuk mencegah double-submit.
+                committed_id, n_bundle, n_bapp = create_transaksi_perpindahan(
+                    dari_lokasi=dari_lokasi,
+                    ke_lokasi=ke_lokasi,
+                    nama_pengirim=st.session_state.data_nama_pengirim.strip(),
+                    nama_penerima=st.session_state.data_nama_penerima.strip(),
+                    nomor_bundle_list=nomor_bundle_list,
+                    drive_folder_id=drive_folder_id,
+                    drive_folder_url=drive_folder_url,
+                    id_transaksi_override=id_transaksi,
+                )
+
+                hasil["id_transaksi"] = committed_id
+                hasil["total_bundle"] = n_bundle
+                hasil["total_bapp"] = n_bapp
                 hasil["drive_folder_url"] = drive_folder_url
 
                 st.session_state.last_result = hasil
                 st.session_state.selected_bundles = []
+                st.session_state.submit_error = None
                 st.session_state.wizard_step = "berhasil"
                 st.rerun()
+
             except ValueError as e:
-                st.error(str(e))
+                # Tidak ada perubahan lokasi kalau validasi/commit gagal.
+                st.session_state.submit_error = str(e)
             except FileNotFoundError as e:
-                st.error(str(e))
+                st.session_state.submit_error = str(e)
             except Exception as e:
-                st.error(
-                    "Perpindahan gagal diproses. "
+                # Jangan tampilkan halaman "berhasil" kalau proses Drive/PDF
+                # gagal. Bundle tetap di lokasi sebelumnya.
+                st.session_state.submit_error = (
+                    "Perpindahan belum dilakukan karena proses PDF/Drive gagal. "
                     f"Detail: {e}"
                 )
+
 
 
 def render_step_berhasil():
