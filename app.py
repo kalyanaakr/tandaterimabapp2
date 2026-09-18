@@ -10,7 +10,7 @@ satu alur form dari atas ke bawah. Sinkronisasi data ada di ikon pengaturan
 Cara pakai singkat (detail lengkap di README.md):
 1. pip install -r requirements.txt
 2. Taruh service_account.json di folder yang sama dengan file ini
-3. Copy .env.example jadi .env, isi DB_SHEET_ID & MASTER_SHEET_ID
+3. Lokal: copy .env.example jadi .env. Cloud: isi DB_SHEET_ID, MASTER_SHEET_ID, dan Google credential di Streamlit Secrets
 4. streamlit run app.py
 """
 import io
@@ -43,6 +43,20 @@ MASTER_SHEET_ID = os.getenv("MASTER_SHEET_ID", "")
 MASTER_SHEET_WORKSHEET_NAME = os.getenv("MASTER_SHEET_WORKSHEET_NAME", "data")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "")
+
+# Credential Google:
+# - Lokal: tetap membaca service_account.json
+# - Streamlit Cloud: membaca [gcp_service_account] dari Streamlit Secrets
+def _get_google_credentials(scopes):
+    if "gcp_service_account" in st.secrets:
+        return Credentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]),
+            scopes=scopes,
+        )
+    return Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=scopes,
+    )
 
 APP_TITLE = "Form Perpindahan Dokumen BAPP"
 
@@ -128,7 +142,7 @@ SHEETS_SCOPES = [
 def get_client():
     if not DB_SHEET_ID:
         raise RuntimeError("DB_SHEET_ID belum diisi di .env")
-    creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SHEETS_SCOPES)
+    creds = _get_google_credentials(SHEETS_SCOPES)
     return gspread.authorize(creds)
 
 
@@ -444,8 +458,8 @@ def drive_is_enabled() -> bool:
 
 
 def _get_drive_service():
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE, scopes=["https://www.googleapis.com/auth/drive"]
+    creds = _get_google_credentials(
+        ["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=creds)
 
