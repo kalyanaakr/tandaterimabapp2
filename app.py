@@ -18,6 +18,7 @@ import io
 import os
 import tempfile
 from datetime import datetime, date
+from collections.abc import Mapping
 
 import numpy as np
 import streamlit as st
@@ -49,20 +50,35 @@ load_dotenv()
 # Streamlit Cloud memakai st.secrets, sedangkan lokal memakai .env.
 # Nilai dari Secrets diprioritaskan jika tersedia.
 def _setting(name: str, default: str = "") -> str:
-    """Ambil setting dari env atau Streamlit Secrets.
+    """Ambil setting dari env atau Streamlit Secrets dengan fallback kuat.
 
-    Selain top-level, fungsi ini juga mencari satu key di dalam tabel Secrets.
-    Ini membantu jika ADMIN_PASSWORD/DRIVE_ROOT_FOLDER_ID tidak sengaja
-    ditempatkan di bawah [gcp_service_account].
+    Mendukung key di level utama maupun di dalam tabel TOML mana pun.
+    Ini membuat aplikasi tetap bisa membaca setting jika pengguna tanpa
+    sengaja menaruh ADMIN_PASSWORD/ADMIN_EMAIL/DRIVE_ROOT_FOLDER_ID di
+    bawah section seperti [gcp_service_account].
     """
     value = os.getenv(name, default)
 
+    def clean(v):
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return str(v)
+        return str(v).strip()
+
     def find_nested(obj):
         try:
-            if isinstance(obj, dict):
-                if name in obj and obj[name] not in (None, ""):
-                    return str(obj[name]).strip()
+            if isinstance(obj, Mapping):
+                if name in obj:
+                    found = clean(obj.get(name))
+                    if found:
+                        return found
                 for child in obj.values():
+                    found = find_nested(child)
+                    if found:
+                        return found
+            elif isinstance(obj, (list, tuple)):
+                for child in obj:
                     found = find_nested(child)
                     if found:
                         return found
@@ -71,17 +87,20 @@ def _setting(name: str, default: str = "") -> str:
         return ""
 
     try:
+        # Cara utama: key top-level Streamlit Secrets.
         secret_value = st.secrets.get(name, None)
-        if secret_value not in (None, ""):
-            value = str(secret_value).strip()
-        else:
-            nested_value = find_nested(dict(st.secrets))
-            if nested_value:
-                value = nested_value
+        found = clean(secret_value)
+        if found:
+            return found
+
+        # Fallback: cari key secara rekursif di seluruh struktur Secrets.
+        nested_value = find_nested(st.secrets)
+        if nested_value:
+            return nested_value
     except Exception:
         pass
 
-    return str(value or "").strip()
+    return clean(value)
 
 
 DB_SHEET_ID = _setting("DB_SHEET_ID")
@@ -837,16 +856,34 @@ def render_admin_page():
         "dan membuka PDF bukti, meskipun admin bukan pengisi form."
     )
 
-    expected_password = _get_admin_password()
+    # Baca ulang saat halaman admin dibuka. Ini membuat perubahan Secrets
+    # terbaca setelah reboot/redeploy tanpa bergantung pada nilai lama
+    # yang tersimpan saat modul pertama kali dimuat.
+    expected_password = _setting("ADMIN_PASSWORD")
+    admin_email = _setting("ADMIN_EMAIL")
+
     if not expected_password:
         st.error(
-            "Akses admin belum dikonfigurasi. Tambahkan ADMIN_PASSWORD di "
-            "Streamlit Secrets (atau .env untuk lokal)."
+            "Akses admin belum dikonfigurasi. ADMIN_PASSWORD tidak terbaca "
+            "dari Streamlit Secrets/.env."
         )
         st.info(
-            "Pastikan ADMIN_PASSWORD berada di level utama Secrets, misalnya "
-            'ADMIN_PASSWORD = "password-kamu". Jangan menaruhnya di bawah [gcp_service_account].'
+            "Format yang disarankan: ADMIN_PASSWORD = \"password-kamu\" "
+            "di level utama Secrets (sebelum [gcp_service_account]). "
+            "Setelah mengubah Secrets, klik Reboot app di Streamlit Cloud."
         )
+        try:
+            top_keys = sorted(
+                str(k) for k in st.secrets.keys()
+                if str(k).lower() not in {
+                    "private_key", "client_secret", "refresh_token",
+                    "password", "token", "secret"
+                }
+            )
+            if top_keys:
+                st.caption("Secrets yang terbaca di level utama: " + ", ".join(top_keys))
+        except Exception:
+            pass
         return
 
     if not _admin_authenticated():
@@ -863,7 +900,7 @@ def render_admin_page():
 
     col1, col2 = st.columns([5, 1])
     with col1:
-        st.success(f"Login admin aktif{(' — ' + _get_admin_email()) if _get_admin_email() else ''}")
+        st.success(f"Login admin aktif{(' — ' + admin_email) if admin_email else ''}")
     with col2:
         if st.button("Keluar", use_container_width=True):
             st.session_state.admin_authenticated = False
