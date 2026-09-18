@@ -1,2347 +1,1563 @@
 """
-SISTEM PENERIMAAN BAPP
-=======================
-Aplikasi Streamlit untuk mencatat penerimaan BAPP fisik menggunakan
-scanner barcode. Data master DAN hasil penerimaan sama-sama disimpan
-di Google Spreadsheet (sheet "data").
+Form Perpindahan Dokumen BAPP — VERSI SATU FILE, konsep seperti Google Form.
+Alur: Form (pengirim/penerima/dari/ke + pilih bundle) -> Summary (+ tanda
+tangan digital pengirim & penerima) -> Submit -> Berhasil (bisa download PDF
+ringkasan yang sudah ada tanda tangannya). Tidak ada sidebar/menu — cuma
+satu alur form dari atas ke bawah. Sinkronisasi data ada di ikon pengaturan
+(⚙️) di pojok kanan atas.
+Cara pakai singkat:
 
-Flow: Daftar Penerimaan BAPP -> (+) Buat Penerimaan Baru
-(popup info) -> halaman scan BAPP -> Simpan -> Detail -> Print.
-
-Cara menjalankan:
-    streamlit run app.py
-
-Lihat PANDUAN.md untuk instruksi instalasi & konfigurasi lengkap.
+- Lokal: service_account.json + .env
+- Streamlit Cloud: Google service account disimpan di Streamlit Secrets
+pada bagian [gcp_service_account], bukan di GitHub.
+- Isi DB_SHEET_ID, MASTER_SHEET_ID, dan bila perlu DRIVE_ROOT_FOLDER_ID.
+- Jalankan: streamlit run app.py
 """
-
-import os
 import io
-import json
-import time
-import base64
-from datetime import datetime
+import os
+import tempfile
+from datetime import datetime, date
+from collections.abc import Mapping
 
-import pandas as pd
+import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
-import sqlite3
-
+import pandas as pd
 import gspread
+from PIL import Image
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas as pdfcanvas
+from streamlit_drawable_canvas import st_canvas
 from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request
+from googleapiclient.errors import HttpError
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from dotenv import load_dotenv
 
-from reportlab.lib.units import cm
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-from reportlab.pdfgen import canvas as pdfcanvas
-from reportlab.graphics.barcode import code128
-from reportlab.graphics.shapes import Drawing
+# Catatan deployment:
 
+# requirements.txt wajib memuat streamlit-drawable-canvas, reportlab, Pillow,
 
-# =====================================================================
-# 1. KONFIGURASI
-# =====================================================================
+# gspread, google-auth, google-api-python-client, pandas, numpy, dan python-dotenv.
 
-SPREADSHEET_ID = "1bgBsR4U5u5dgjTONE1RrMPHV2-prJXjfLd9Kf2Z5Jsc"
-SHEET_NAME = "data"
+# =============================================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
-DB_FILE = os.path.join(BASE_DIR, "bapp_cadangan.db")
+# 1. KONFIGURASI (lokal dari .env, Cloud dari Streamlit Secrets)
 
-# Baris judul kolom di sheet "data" ada di baris ke-3 (baris 1-2 dipakai untuk
-# info "Last Update" / "Summary"), data sebenarnya mulai baris ke-4.
-BARIS_HEADER = 3
+# =============================================================================
 
-# Kolom data sekolah yang dibaca dari sheet "data" (sudah ada dari awal).
-# "Nomor Urut Penerimaan" (tanpa akhiran) adalah nomor urut dari penerimaan
-# PERTAMA -- dipakai di sini murni sebagai referensi tampilan, tidak diubah.
-KOLOM_DATA_SEKOLAH = [
-    "Nomor Transaksi",
-    "NPSN",
-    "Nama Sekolah",
-    "Nomor Penerimaan",
-    "Nomor Urut Penerimaan",
-    "Serial Number",
-    "Nama Koordinator",
-    "Barcode Penerimaan",
-    "Tanggal BAPP",
-]
+load_dotenv()
 
-# Kolom untuk penerimaan KEDUA/BARU -- ini yang ditulis oleh aplikasi ini.
-KOLOM_STATUS_BARU = "Status BAPP Fisik Kedua"
-KOLOM_WAKTU_BARU = "Waktu BAPP diterima Baru"
-KOLOM_NOMOR_BARU = "Nomor Penerimaan Baru"
-KOLOM_PENGIRIM = "Nama Pengirim"
-KOLOM_PIC = "PIC Penerimaan"
-KOLOM_URUTAN_BARU = "Nomor Urut Penerimaan Baru"  # dipakai internal utk urutan simpan
-KOLOM_URUTAN_PERTAMA = "Nomor Urut Penerimaan"    # referensi, sudah ada di sheet
-# Timestamp presisi (tanggal + jam:menit:detik) saat penerimaan DIBUAT --
-# HANYA dipakai untuk mengurutkan Daftar Penerimaan BAPP sesuai urutan
-# pembuatan folder yang sebenarnya. Tidak pernah ditampilkan ke user di
-# mana pun (beda dengan KOLOM_WAKTU_BARU yang cuma tanggal, buat tampilan).
-KOLOM_TIMESTAMP_URUT = "Timestamp Penerimaan Baru"
+# Streamlit Cloud memakai st.secrets, sedangkan lokal memakai .env.
 
-KOLOM_TULIS = [
-    KOLOM_STATUS_BARU, KOLOM_WAKTU_BARU, KOLOM_NOMOR_BARU,
-    KOLOM_PENGIRIM, KOLOM_PIC, KOLOM_URUTAN_BARU, KOLOM_TIMESTAMP_URUT,
-]
-KOLOM_WAJIB = KOLOM_DATA_SEKOLAH + KOLOM_TULIS
+# Nilai dari Secrets diprioritaskan jika tersedia.
 
-# Nilai status folder/penerimaan yang ditulis ke KOLOM_STATUS_BARU.
-STATUS_OPEN = "OPEN"
-STATUS_DITERIMA = "DITERIMA"
+def _setting(name: str, default: str = "") -> str:
+    """Ambil setting dari env atau Streamlit Secrets dengan fallback kuat.
 
-DAFTAR_DIREKTORAT_DEFAULT = ["SD", "SMP", "SMA", "SMK"]
-UKURAN_HALAMAN_DAFTAR = 50
-BAPP_PER_LEMBAR_PRINT = 35
-
-# Target total BAPP keseluruhan -- dipakai untuk hitung persentase progress
-# di kartu ringkasan halaman Daftar Penerimaan BAPP.
-TARGET_TOTAL_BAPP = 15000
-
-# Ukuran kertas print Penerimaan BAPP: A4 portrait
-KERTAS_PRINT = A4
-
-st.set_page_config(page_title="Sistem Penerimaan BAPP", page_icon="📦", layout="wide")
-
-st.markdown(
+    Mendukung key di level utama maupun di dalam tabel TOML mana pun.
+    Ini membuat aplikasi tetap bisa membaca setting jika pengguna tanpa
+    sengaja menaruh ADMIN_PASSWORD/ADMIN_EMAIL/DRIVE_ROOT_FOLDER_ID di
+    bawah section seperti [gcp_service_account].
     """
-    <style>
-    .stButton > button { border-radius: 10px; font-weight: 500; transition: all 0.15s ease; }
-    .stButton > button[kind="primary"] { background-color: #2563eb; border-color: #2563eb; }
-    .stButton > button:hover { filter: brightness(0.95); border-color: #93c5fd; }
-    div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] { border-radius: 8px; }
-    div[data-testid="stHorizontalBlock"] {
-        border-radius: 8px;
-        transition: background-color 0.1s ease;
-    }
-    div[data-testid="stHorizontalBlock"]:hover {
-        background-color: #f8fafc;
-    }
+    value = os.getenv(name, default)
 
-    /* Perkecil ukuran font tampilan web (TIDAK memengaruhi file PDF,
-       karena PDF dibuat terpisah lewat reportlab, bukan CSS ini). */
-    html, body, [class^="st-"], [class*=" st-"] { font-size: 14px; }
-    h1 { font-size: 2.1rem !important; }
-    h2 { font-size: 1.2rem !important; }
-    h3, h4 { font-size: 1.05rem !important; }
-    .stMarkdown p, .stMarkdown li, div[data-testid="stCaptionContainer"] { font-size: 0.85rem !important; }
-    .stButton > button { font-size: 0.85rem !important; }
-    div[data-testid="stTextInput"] input,
-    div[data-testid="stSelectbox"] div,
-    div[data-testid="stDateInput"] input { font-size: 0.85rem !important; }
-    div[data-testid="stDataFrame"] { font-size: 0.8rem !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    def clean(v):
+        if v is None:
+            return ""
+        if isinstance(v, bool):
+            return str(v)
+        return str(v).strip()
 
-
-# =====================================================================
-# 2. DATABASE LOKAL -- HANYA untuk cadangan tersembunyi & pengaturan
-# =====================================================================
-
-def get_conn():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
-
-
-@st.cache_resource
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS pengaturan (key TEXT PRIMARY KEY, value TEXT)")
-    cur.execute("INSERT OR IGNORE INTO pengaturan (key, value) VALUES ('termin_penerimaan', '2')")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS backup_penerimaan (
-            nomor_penerimaan TEXT PRIMARY KEY,
-            direktorat TEXT,
-            waktu TEXT,
-            jumlah_bapp INTEGER,
-            detail_json TEXT,
-            nama_pengirim TEXT,
-            pic_penerimaan TEXT
-        )
-        """
-    )
-    for kolom in ("nama_pengirim", "pic_penerimaan"):
+    def find_nested(obj):
         try:
-            cur.execute(f"ALTER TABLE backup_penerimaan ADD COLUMN {kolom} TEXT")
-        except sqlite3.OperationalError:
+            if isinstance(obj, Mapping):
+                if name in obj:
+                    found = clean(obj.get(name))
+                    if found:
+                        return found
+                for child in obj.values():
+                    found = find_nested(child)
+                    if found:
+                        return found
+            elif isinstance(obj, (list, tuple)):
+                for child in obj:
+                    found = find_nested(child)
+                    if found:
+                        return found
+        except Exception:
             pass
-    conn.commit()
-    conn.close()
+        return ""
 
-
-def get_setting(key, default=None):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM pengaturan WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-
-def set_setting(key, value):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO pengaturan (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def simpan_cadangan_lokal(nomor_penerimaan, direktorat, waktu, scan_list, nama_pengirim="", pic_penerimaan=""):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO backup_penerimaan "
-            "(nomor_penerimaan, direktorat, waktu, jumlah_bapp, detail_json, nama_pengirim, pic_penerimaan) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (nomor_penerimaan, direktorat, waktu, len(scan_list),
-             json.dumps(scan_list, ensure_ascii=False), nama_pengirim, pic_penerimaan),
-        )
-        conn.commit()
-        conn.close()
+        # Cara utama: key top-level Streamlit Secrets.
+        secret_value = st.secrets.get(name, None)
+        found = clean(secret_value)
+        if found:
+            return found
+
+        # Fallback: cari key secara rekursif di seluruh struktur Secrets.
+        nested_value = find_nested(st.secrets)
+        if nested_value:
+            return nested_value
     except Exception:
         pass
 
-
-def hapus_cadangan_lokal(nomor_penerimaan):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM backup_penerimaan WHERE nomor_penerimaan = ?", (nomor_penerimaan,))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
-
-
-# =====================================================================
-# 3. KONEKSI GOOGLE SPREADSHEET (baca + tulis)
-# =====================================================================
-
-def _panggil_dengan_retry(fungsi, percobaan=3, jeda_detik=2):
-    """Menjalankan pemanggilan ke Google Sheets API dengan percobaan ulang
-    otomatis. Gangguan koneksi sesaat (internet tidak stabil, firewall/
-    antivirus/proxy) sering hilang sendiri kalau dicoba lagi beberapa detik
-    kemudian, jadi tidak perlu langsung dianggap gagal total."""
-    error_terakhir = None
-    for percobaan_ke in range(percobaan):
-        try:
-            return fungsi()
-        except Exception as e:
-            error_terakhir = e
-            if percobaan_ke < percobaan - 1:
-                time.sleep(jeda_detik)
-    raise error_terakhir
-
-
-def _pesan_error_ramah(e):
-    """Menerjemahkan error koneksi teknis jadi pesan yang lebih mudah
-    dipahami, tanpa menyembunyikan pesan aslinya."""
-    teks = str(e)
-    penanda_jaringan = [
-        "ConnectionReset", "Connection aborted", "Max retries exceeded",
-        "RemoteDisconnected", "ConnectionError", "10054", "timed out", "Timeout",
-    ]
-    if any(p.lower() in teks.lower() for p in penanda_jaringan):
-        return (
-            f"Koneksi ke Google terputus sesaat (sudah dicoba ulang beberapa kali tapi "
-            f"masih gagal). Biasanya karena internet yang kurang stabil, atau ada "
-            f"firewall/antivirus/proxy yang mengganggu koneksi ke Google. Coba tekan "
-            f"Refresh lagi, atau periksa koneksi internet Anda. Detail teknis: {teks}"
-        )
-    return teks
-
-
-@st.cache_resource
-def get_gsheet_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    try:
-        ada_secret = "gcp_service_account" in st.secrets
-    except Exception:
-        ada_secret = False
-
-    if ada_secret:
-        # Dipakai saat aplikasi di-deploy online (mis. Streamlit Community
-        # Cloud) -- kredensial diambil dari fitur Secrets, bukan file lokal.
-        creds = Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]), scopes=scopes
-        )
-    else:
-        # Dipakai saat dijalankan lokal di komputer sendiri.
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    return gspread.authorize(creds)
-
-
-@st.cache_resource
-def get_worksheet():
-    client = get_gsheet_client()
-    sh = _panggil_dengan_retry(lambda: client.open_by_key(SPREADSHEET_ID))
-    return _panggil_dengan_retry(lambda: sh.worksheet(SHEET_NAME))
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_master_data():
-    ws = get_worksheet()
-    semua = _panggil_dengan_retry(lambda: ws.get_all_values())
-    if len(semua) < BARIS_HEADER:
-        return pd.DataFrame(columns=["_baris_sheet"])
-
-    header_mentah = [h.strip() for h in semua[BARIS_HEADER - 1]]
-    n_kolom = len(header_mentah)
-
-    header_bersih = []
-    jumlah_pakai = {}
-    for h in header_mentah:
-        if h == "":
-            header_bersih.append(None)
-            continue
-        jumlah_pakai[h] = jumlah_pakai.get(h, 0) + 1
-        header_bersih.append(h if jumlah_pakai[h] == 1 else f"{h} ({jumlah_pakai[h]})")
-
-    baris_data = [(row + [""] * n_kolom)[:n_kolom] for row in semua[BARIS_HEADER:]]
-
-    df = pd.DataFrame(baris_data, columns=header_bersih)
-    df = df.loc[:, [c for c in df.columns if c is not None]]
-    df["_baris_sheet"] = range(BARIS_HEADER + 1, len(df) + BARIS_HEADER + 1)
-    return df
-
-
-def refresh_master_data():
-    try:
-        load_master_data.clear()
-        _header_dan_idx_kolom_tulis.clear()
-        df = load_master_data()
-        missing = [k for k in KOLOM_WAJIB if k not in df.columns]
-        if missing:
-            st.session_state.load_error = (
-                f"Kolom berikut belum ada di sheet '{SHEET_NAME}': {', '.join(missing)}. "
-                f"Tambahkan dulu di baris judul (baris {BARIS_HEADER}) Spreadsheet -- lihat PANDUAN.md."
-            )
-            return False
-        st.session_state.master_df = df
-        _invalidate_derived_cache()
-        st.session_state.last_refresh = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-        st.session_state.last_refresh_ts = datetime.now()
-        st.session_state.load_error = None
-        return True
-    except FileNotFoundError:
-        st.session_state.load_error = (
-            f"File '{os.path.basename(CREDENTIALS_FILE)}' tidak ditemukan di folder aplikasi. "
-            f"Ikuti PANDUAN.md bagian pembuatan credentials Google."
-        )
-        return False
-    except Exception as e:
-        st.session_state.load_error = _pesan_error_ramah(e)
-        return False
-
-
-def get_daftar_direktorat():
-    df = st.session_state.get("master_df", pd.DataFrame())
-    if not df.empty and "Direktorat" in df.columns:
-        daftar = sorted(x for x in df["Direktorat"].dropna().unique().tolist() if str(x).strip())
-        if daftar:
-            return daftar
-    return DAFTAR_DIREKTORAT_DEFAULT
-
-
-# =====================================================================
-# 4. NOMOR PENERIMAAN & PENYIMPANAN / PENGHAPUSAN DI SPREADSHEET
-# =====================================================================
-
-def generate_nomor_penerimaan(direktorat):
-    termin = get_setting("termin_penerimaan", "2")
-    prefix = f"{direktorat.upper()}{termin}-"
-
-    df = st.session_state.get("master_df", pd.DataFrame())
-    max_urut = 0
-    if not df.empty and KOLOM_NOMOR_BARU in df.columns:
-        existing = df[KOLOM_NOMOR_BARU].astype("string").str.strip()
-        kandidat = existing[existing.str.startswith(prefix, na=False)].str.slice(len(prefix))
-        kandidat = pd.to_numeric(kandidat, errors="coerce")
-        if not kandidat.empty and kandidat.notna().any():
-            max_urut = int(kandidat.max())
-
-    return f"{prefix}{max_urut + 1:03d}"
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _header_dan_idx_kolom_tulis():
-    ws = get_worksheet()
-    header = [h.strip() for h in _panggil_dengan_retry(lambda: ws.row_values(BARIS_HEADER))]
-    missing = [k for k in KOLOM_TULIS if k not in header]
-    if missing:
-        raise RuntimeError(f"Kolom berikut belum ada di sheet '{SHEET_NAME}': {', '.join(missing)}.")
-    return {k: header.index(k) + 1 for k in KOLOM_TULIS}
-
-
-def catat_scan_ke_spreadsheet(item, info, urutan):
-    """Menulis SATU baris BAPP ke Spreadsheet segera setelah berhasil di-scan,
-    berstatus OPEN -- supaya progress tidak hilang walau browser ditutup dan
-    bisa dilanjutkan lagi nanti (lihat muat_penerimaan_open)."""
-    ws = get_worksheet()
-    idx = _header_dan_idx_kolom_tulis()
-
-    waktu_tulis = info["tanggal"].strftime("%d/%m/%Y")
-    timestamp_urut = info.get("waktu_buat") or datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
-    baris = item["_baris_sheet"]
-    nilai = {
-        KOLOM_STATUS_BARU: STATUS_OPEN,
-        KOLOM_WAKTU_BARU: waktu_tulis,
-        KOLOM_NOMOR_BARU: info["nomor_penerimaan"],
-        KOLOM_PENGIRIM: info["nama_pengirim"],
-        KOLOM_PIC: info["pic"],
-        KOLOM_URUTAN_BARU: str(urutan),
-        KOLOM_TIMESTAMP_URUT: timestamp_urut,
-    }
-    updates = [{"range": rowcol_to_a1(baris, idx[k]), "values": [[v]]} for k, v in nilai.items()]
-    _panggil_dengan_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
-
-    df = st.session_state.master_df
-    mask = df["_baris_sheet"] == baris
-    for k, v in nilai.items():
-        df.loc[mask, k] = v
-    st.session_state.master_df = df
-    _invalidate_derived_cache()
-
-    # cadangan lokal di-update setiap scan supaya selalu mencerminkan progress terkini
-    simpan_cadangan_lokal(
-        info["nomor_penerimaan"], info["direktorat"], waktu_tulis,
-        st.session_state.scan_list, info["nama_pengirim"], info["pic"],
-    )
-
-
-def hapus_satu_baris_bapp(item):
-    """Mengosongkan kembali 6 kolom penerimaan baru untuk SATU baris BAPP saja
-    (dipakai saat hapus 1 baris dari penerimaan yang masih OPEN)."""
-    ws = get_worksheet()
-    idx = _header_dan_idx_kolom_tulis()
-    baris = item["_baris_sheet"]
-    updates = [{"range": rowcol_to_a1(baris, idx[k]), "values": [[""]]} for k in KOLOM_TULIS]
-    _panggil_dengan_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
-
-    df = st.session_state.master_df
-    mask = df["_baris_sheet"] == baris
-    for k in KOLOM_TULIS:
-        df.loc[mask, k] = ""
-    st.session_state.master_df = df
-    _invalidate_derived_cache()
-
-
-def tutup_penerimaan(nomor_penerimaan):
-    """Menutup folder/penerimaan: ubah status semua baris terkait dari OPEN
-    menjadi DITERIMA (final). Setelah ini datanya tidak diedit lagi oleh
-    aplikasi (baik lewat scan/hapus baris)."""
-    df = st.session_state.get("master_df", pd.DataFrame())
-    baris_terkait = df[df[KOLOM_NOMOR_BARU].astype(str) == str(nomor_penerimaan)]
-    if baris_terkait.empty:
-        raise RuntimeError("Tidak ada BAPP dalam penerimaan ini untuk ditutup.")
-
-    ws = get_worksheet()
-    idx = _header_dan_idx_kolom_tulis()
-
-    updates = [
-        {"range": rowcol_to_a1(int(item["_baris_sheet"]), idx[KOLOM_STATUS_BARU]), "values": [[STATUS_DITERIMA]]}
-        for _, item in baris_terkait.iterrows()
-    ]
-    _panggil_dengan_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
-
-    mask = df[KOLOM_NOMOR_BARU].astype(str) == str(nomor_penerimaan)
-    df.loc[mask, KOLOM_STATUS_BARU] = STATUS_DITERIMA
-    st.session_state.master_df = df
-    _invalidate_derived_cache()
-
-
-def muat_penerimaan_open(nomor_penerimaan):
-    """Memuat ulang data penerimaan yang masih berstatus OPEN dari Spreadsheet
-    ke session_state (penerimaan_aktif + scan_list), supaya operator bisa
-    melanjutkan scan dari sesi/perangkat manapun. Mengembalikan (berhasil, pesan_error)."""
-    df = st.session_state.get("master_df", pd.DataFrame())
-    subset = df[df[KOLOM_NOMOR_BARU].astype(str) == str(nomor_penerimaan)].copy()
-    if subset.empty:
-        return False, "Data penerimaan tidak ditemukan."
-
-    status_mentah = str(subset.iloc[0].get(KOLOM_STATUS_BARU, "")).strip().upper()
-    if status_mentah != STATUS_OPEN:
-        return False, "Penerimaan ini sudah DITERIMA (ditutup) dan tidak bisa diedit lagi."
-
-    subset["_urut_num"] = pd.to_numeric(subset[KOLOM_URUTAN_BARU], errors="coerce")
-    subset = subset.sort_values("_urut_num")
-
-    scan_list_baru = []
-    for _, r in subset.iterrows():
-        scan_list_baru.append({
-            "nomor_transaksi": str(r.get("Nomor Transaksi", "")).strip(),
-            "npsn": str(r.get("NPSN", "")).strip(),
-            "nama_sekolah": str(r.get("Nama Sekolah", "")).strip(),
-            "nomor_penerimaan_pertama": str(r.get("Nomor Penerimaan", "")).strip(),
-            "nomor_urut_pertama": str(r.get(KOLOM_URUTAN_PERTAMA, "")).strip(),
-            "serial_number": str(r.get("Serial Number", "")).strip(),
-            "nama_koordinator": str(r.get("Nama Koordinator", "")).strip(),
-            "_baris_sheet": int(r["_baris_sheet"]),
-        })
-
-    baris_pertama = subset.iloc[0]
-    waktu_str = str(baris_pertama.get(KOLOM_WAKTU_BARU, "")).strip()
-    try:
-        tanggal_obj = datetime.strptime(waktu_str.split(" ")[0], "%d/%m/%Y").date()
-    except Exception:
-        tanggal_obj = datetime.now().date()
-
-    st.session_state.penerimaan_aktif = {
-        "nomor_penerimaan": str(nomor_penerimaan),
-        "direktorat": str(baris_pertama.get("Direktorat", "")),
-        "nama_pengirim": str(baris_pertama.get(KOLOM_PENGIRIM, "")),
-        "tanggal": tanggal_obj,
-        "pic": str(baris_pertama.get(KOLOM_PIC, "")),
-        # Pulihkan timestamp pembuatan ASLI dari Spreadsheet (bukan bikin
-        # baru) supaya urutan di Daftar Penerimaan BAPP tetap benar
-        # walau penerimaan ini dilanjutkan lagi nanti/dari sesi lain.
-        "waktu_buat": str(baris_pertama.get(KOLOM_TIMESTAMP_URUT, "")).strip() or None,
-    }
-    st.session_state.scan_list = scan_list_baru
-    st.session_state.scan_message = None
-    return True, None
-
-
-def hapus_penerimaan(nomor_penerimaan):
-    """Menghapus SELURUH penerimaan (biasanya untuk penerimaan yang masih
-    OPEN dan ingin dibatalkan total): mengosongkan kembali 6 kolom penerimaan
-    baru pada baris-baris terkait di Spreadsheet, sehingga BAPP tsb tersedia
-    lagi untuk diterima ulang di penerimaan lain."""
-    df = st.session_state.get("master_df", pd.DataFrame())
-    if df.empty or KOLOM_NOMOR_BARU not in df.columns:
-        return
-    baris_terkait = df[df[KOLOM_NOMOR_BARU].astype(str) == str(nomor_penerimaan)]
-    if baris_terkait.empty:
-        return
-
-    ws = get_worksheet()
-    idx = _header_dan_idx_kolom_tulis()
-
-    updates = []
-    for _, item in baris_terkait.iterrows():
-        baris = int(item["_baris_sheet"])
-        for kolom in KOLOM_TULIS:
-            updates.append({"range": rowcol_to_a1(baris, idx[kolom]), "values": [[""]]})
-    _panggil_dengan_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
-
-    mask = df[KOLOM_NOMOR_BARU].astype(str) == str(nomor_penerimaan)
-    for kolom in KOLOM_TULIS:
-        df.loc[mask, kolom] = ""
-    st.session_state.master_df = df
-    _invalidate_derived_cache()
-
-    hapus_cadangan_lokal(nomor_penerimaan)
-
-
-def _master_revision():
-    return st.session_state.get("master_revision", 0)
-
-
-def _invalidate_derived_cache():
-    st.session_state.master_revision = _master_revision() + 1
-    st.session_state.pop("riwayat_cache", None)
-    st.session_state.pop("dashboard_cache", None)
-    st.session_state.pop("detail_cache", None)
-    st.session_state.pop("pdf_cache", None)
-
-
-def get_dashboard_ringkas():
-    revision = _master_revision()
-    cached = st.session_state.get("dashboard_cache")
-    if cached and cached[0] == revision:
-        return cached[1], cached[2]
-    df = st.session_state.get("master_df", pd.DataFrame())
-    total_hari_ini = total_diterima = 0
-    if not df.empty and KOLOM_WAKTU_BARU in df.columns:
-        nilai = df[KOLOM_WAKTU_BARU].astype("string")
-        hari_ini = datetime.now().strftime("%d/%m/%Y")
-        total_hari_ini = int(nilai.str.startswith(hari_ini, na=False).sum())
-    if not df.empty and KOLOM_STATUS_BARU in df.columns:
-        nilai = df[KOLOM_STATUS_BARU].astype("string").str.strip().str.upper()
-        total_diterima = int((nilai == STATUS_DITERIMA).sum())
-    st.session_state.dashboard_cache = (revision, total_hari_ini, total_diterima)
-    return total_hari_ini, total_diterima
-
-
-def get_riwayat():
-    revision = _master_revision()
-    cached = st.session_state.get("riwayat_cache")
-    if cached and cached[0] == revision:
-        return cached[1].copy()
-    kosong = pd.DataFrame(columns=["Nomor Penerimaan", "Tanggal", "Pengirim", "Direktorat", "Jumlah BAPP", "PIC", "Status"])
-    df = st.session_state.get("master_df", pd.DataFrame())
-    if df.empty or KOLOM_NOMOR_BARU not in df.columns:
-        return kosong
-
-    terisi = df[df[KOLOM_NOMOR_BARU].astype(str).str.strip() != ""]
-    if terisi.empty:
-        return kosong
-
-    agg_dict = {
-        "Direktorat": ("Direktorat", "first") if "Direktorat" in terisi.columns else (KOLOM_NOMOR_BARU, "first"),
-        "Waktu": (KOLOM_WAKTU_BARU, "first"),
-        "Jumlah BAPP": (KOLOM_NOMOR_BARU, "count"),
-        "Status": (KOLOM_STATUS_BARU, "first"),
-    }
-    if KOLOM_PENGIRIM in terisi.columns:
-        agg_dict["Pengirim"] = (KOLOM_PENGIRIM, "first")
-    if KOLOM_PIC in terisi.columns:
-        agg_dict["PIC"] = (KOLOM_PIC, "first")
-    if KOLOM_TIMESTAMP_URUT in terisi.columns:
-        agg_dict["TimestampUrut"] = (KOLOM_TIMESTAMP_URUT, "first")
-
-    ringkasan = (
-        terisi.groupby(KOLOM_NOMOR_BARU).agg(**agg_dict).reset_index()
-        .rename(columns={KOLOM_NOMOR_BARU: "Nomor Penerimaan"})
-    )
-    # nilai lama sebelum fitur status ada (mis. "Diterima") dianggap tetap DITERIMA
-    ringkasan["Status"] = ringkasan["Status"].apply(
-        lambda v: STATUS_OPEN if str(v).strip().upper() == STATUS_OPEN else STATUS_DITERIMA
-    )
-    # ambil bagian tanggal saja -- kompatibel dengan data lama yang masih
-    # menyertakan jam ("03/09/2026 14:30") maupun data baru tanpa jam ("03/09/2026")
-    tanggal_saja = ringkasan["Waktu"].astype(str).str.split(" ").str[0]
-    ringkasan["_tanggal_dt"] = pd.to_datetime(tanggal_saja, format="%d/%m/%Y", errors="coerce")
-    ringkasan["Tanggal"] = ringkasan["_tanggal_dt"].dt.strftime("%d/%m/%Y")
-
-    # Urutan TAMPILAN di Daftar Penerimaan BAPP dihitung dari timestamp
-    # presisi (tanggal+jam) saat folder dibuat -- BUKAN dari tanggal saja --
-    # supaya penerimaan yang dibuat di hari yang sama tetap terurut sesuai
-    # urutan pembuatan sebenarnya, bukan "kebetulan" ketuker ke urutan
-    # Nomor Penerimaan (yang diawali kode Direktorat). Untuk data lama yang
-    # dibuat sebelum kolom Timestamp Penerimaan Baru ada, fallback ke
-    # tanggal saja supaya tetap muncul (walau urutan dalam 1 hari itu
-    # sendiri tidak presisi).
-    if "TimestampUrut" in ringkasan.columns:
-        ringkasan["_urut_dt"] = pd.to_datetime(
-            ringkasan["TimestampUrut"], format="%d/%m/%Y %H:%M:%S.%f", errors="coerce"
-        )
-        ringkasan["_urut_dt"] = ringkasan["_urut_dt"].fillna(ringkasan["_tanggal_dt"])
-    else:
-        ringkasan["_urut_dt"] = ringkasan["_tanggal_dt"]
-
-    kolom_dibuang = ["_tanggal_dt", "_urut_dt", "Waktu"]
-    if "TimestampUrut" in ringkasan.columns:
-        kolom_dibuang.append("TimestampUrut")
-
-    ringkasan = (
-        ringkasan.sort_values(
-            ["_urut_dt", "Nomor Penerimaan"],
-            ascending=[False, False],
-            na_position="last",
-        )
-        .drop(columns=kolom_dibuang)
-    )
-
-    for kolom in ["Pengirim", "PIC"]:
-        if kolom not in ringkasan.columns:
-            ringkasan[kolom] = ""
-
-    hasil_riwayat = ringkasan.reset_index(drop=True)
-    st.session_state.riwayat_cache = (revision, hasil_riwayat)
-    return hasil_riwayat.copy()
-
-
-def ekstrak_nomor_penerimaan_pertama(nilai):
-    """Nomor Penerimaan Pertama dari spreadsheet formatnya 'BAPP-RCV-SD-0006' --
-    tampilkan cuma bagian setelah 'BAPP-RCV-' (mis. 'SD-0006')."""
-    nilai = str(nilai).strip()
-    prefix = "BAPP-RCV-"
-    if nilai.upper().startswith(prefix):
-        return nilai[len(prefix):]
-    return nilai
-
-
-def format_tanggal_bapp(nilai):
-    """Format kolom 'Tanggal BAPP' jadi DD/MM/YYYY. Kalau sumbernya masih
-    mengandung jam, bagian jam dibuang. Kalau formatnya tidak dikenali,
-    tampilkan apa adanya (bukan error)."""
-    teks = str(nilai).strip()
-    if not teks:
-        return "-"
-    teks_tanggal = teks.split(" ")[0]
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(teks_tanggal, fmt).strftime("%d/%m/%Y")
-        except ValueError:
-            continue
-    return teks
-
-
-def get_detail_penerimaan(nomor_penerimaan):
-    nomor_kunci = str(nomor_penerimaan)
-    cache = st.session_state.setdefault("detail_cache", {})
-    cached = cache.get(nomor_kunci)
-    if cached is not None:
-        tabel_cached, info_cached = cached
-        return tabel_cached.copy(), info_cached.copy()
-
-    df = st.session_state.get("master_df", pd.DataFrame())
-    if df.empty or KOLOM_NOMOR_BARU not in df.columns:
-        return pd.DataFrame(), {}
-
-    subset = df[df[KOLOM_NOMOR_BARU].astype(str) == nomor_kunci].copy()
-    if subset.empty:
-        return pd.DataFrame(), {}
-
-    if KOLOM_URUTAN_BARU in subset.columns:
-        subset["_urut_num"] = pd.to_numeric(subset[KOLOM_URUTAN_BARU], errors="coerce")
-        subset = subset.sort_values("_urut_num")
-
-    baris_pertama = subset.iloc[0]
-    status_mentah = str(baris_pertama.get(KOLOM_STATUS_BARU, "")).strip().upper()
-    info = {
-        "nomor_penerimaan": str(nomor_penerimaan),
-        "direktorat": str(baris_pertama.get("Direktorat", "")),
-        "pengirim": str(baris_pertama.get(KOLOM_PENGIRIM, "")),
-        "pic": str(baris_pertama.get(KOLOM_PIC, "")),
-        "waktu": str(baris_pertama.get(KOLOM_WAKTU_BARU, "")),
-        "jumlah": len(subset),
-        "status": STATUS_OPEN if status_mentah == STATUS_OPEN else STATUS_DITERIMA,
-    }
-
-    def kolom_atau_kosong(nama):
-        return subset[nama] if nama in subset.columns else [""] * len(subset)
-
-    tabel = pd.DataFrame({
-        "Nomor": range(1, len(subset) + 1),
-        "Nomor Transaksi": kolom_atau_kosong("Nomor Transaksi"),
-        "NPSN": kolom_atau_kosong("NPSN"),
-        "Nama Sekolah": kolom_atau_kosong("Nama Sekolah"),
-        "Tanggal BAPP": [format_tanggal_bapp(v) for v in kolom_atau_kosong("Tanggal BAPP")],
-        "Nomor Penerimaan Pertama": [ekstrak_nomor_penerimaan_pertama(v) for v in kolom_atau_kosong("Nomor Penerimaan")],
-        "Barcode Penerimaan": kolom_atau_kosong("Barcode Penerimaan"),
-        "Nomor Urut": kolom_atau_kosong(KOLOM_URUTAN_PERTAMA),
-        "Serial Number": kolom_atau_kosong("Serial Number"),
-        "Nama Koordinator": kolom_atau_kosong("Nama Koordinator"),
-    }).reset_index(drop=True)
-
-    cache[nomor_kunci] = (tabel.copy(), info.copy())
-    return tabel, info
-
-
-# =====================================================================
-# 5. LOGIKA SCAN
-# =====================================================================
-
-def cari_nomor_transaksi_lengkap(df, input_teks):
-    """Kalau input_teks berupa angka murni (1-5 digit) -- shorthand dari
-    5 digit terakhir Nomor Transaksi yang unik -- cari Nomor Transaksi
-    LENGKAP yang berakhiran digit tsb (di-padding jadi 5 digit, mis. '2'
-    -> '00002', cocok dengan '...0000000002'). Mengembalikan
-    (nomor_transaksi_lengkap, pesan_error). Kalau input_teks bukan angka
-    murni atau lebih dari 5 digit (berarti sudah nomor lengkap / hasil
-    scan barcode), dikembalikan apa adanya tanpa diubah."""
-    input_teks = input_teks.strip()
-    if not input_teks.isdigit() or len(input_teks) > 5 or df.empty or "Nomor Transaksi" not in df.columns:
-        return input_teks, None
-
-    digit_padded = input_teks.zfill(5)
-    semua_nomor = df["Nomor Transaksi"].astype(str).str.strip()
-    cocok = semua_nomor[semua_nomor.str.endswith(digit_padded)]
-
-    if cocok.empty:
-        return input_teks, f"❌ Tidak ditemukan Nomor Transaksi yang berakhiran {digit_padded}."
-    if cocok.nunique() > 1:
-        return input_teks, (
-            f"⚠️ Ada {cocok.nunique()} Nomor Transaksi yang berakhiran {digit_padded} -- "
-            f"ketik lebih banyak digit supaya lebih spesifik."
-        )
-    return cocok.iloc[0], None
-
-
-def proses_scan(nomor_transaksi):
-    df = st.session_state.get("master_df", pd.DataFrame())
-    if df.empty or "Nomor Transaksi" not in df.columns:
-        st.session_state.scan_message = (
-            "error", "Data master belum tersedia. Buka menu Pengaturan lalu tekan Refresh Data.",
-        )
-        return
-
-    nomor_transaksi = nomor_transaksi.strip()
-
-    # Dukung input shorthand (mis. cuma ketik '2' untuk cari yang
-    # berakhiran '00002') selain scan barcode / ketik nomor lengkap biasa.
-    nomor_transaksi, pesan_error_shorthand = cari_nomor_transaksi_lengkap(df, nomor_transaksi)
-    if pesan_error_shorthand:
-        st.session_state.scan_message = ("error", pesan_error_shorthand)
-        return
-
-    cocok = df[df["Nomor Transaksi"].astype(str).str.strip() == nomor_transaksi]
-
-    if cocok.empty:
-        st.session_state.scan_message = ("error", f"❌ Nomor transaksi tidak ditemukan: {nomor_transaksi}")
-        return
-
-    baris = cocok.iloc[0]
-    nama_sekolah = str(baris.get("Nama Sekolah", "")).strip()
-
-    # Batasi per-direktorat: BAPP harus punya Direktorat yang sama dengan
-    # penerimaan yang sedang dibuat -- kalau beda, tolak.
-    info_aktif = st.session_state.get("penerimaan_aktif") or {}
-    direktorat_aktif = str(info_aktif.get("direktorat", "")).strip().upper()
-    direktorat_bapp = str(baris.get("Direktorat", "")).strip().upper()
-    if direktorat_aktif and direktorat_bapp and direktorat_aktif != direktorat_bapp:
-        st.session_state.scan_message = (
-            "error",
-            f"❌ BAPP ini milik Direktorat {direktorat_bapp}, bukan {direktorat_aktif} "
-            f"(Direktorat penerimaan yang sedang berjalan). Tidak bisa ditambahkan.",
-        )
-        return
-
-    nomor_lama = str(baris.get(KOLOM_NOMOR_BARU, "")).strip()
-    if nomor_lama:
-        st.session_state.scan_message = (
-            "warning",
-            f"⚠️ BAPP sudah diterima — {nomor_transaksi} sudah tercatat pada penerimaan {nomor_lama}.",
-        )
-        return
-
-    serial_number = str(baris.get("Serial Number", "")).strip()
-
-    for item in st.session_state.scan_list:
-        if item["nomor_transaksi"] == nomor_transaksi:
-            st.session_state.scan_message = ("warning", "⚠️ BAPP sudah ada dalam daftar penerimaan ini.")
-            return
-        if serial_number and item["serial_number"] == serial_number:
-            st.session_state.scan_message = (
-                "warning", f"⚠️ Serial Number sudah ada dalam daftar penerimaan ini: {serial_number}",
-            )
-            return
-
-    st.session_state.scan_list.append(
-        {
-            "nomor_transaksi": nomor_transaksi,
-            "npsn": str(baris.get("NPSN", "")).strip(),
-            "nama_sekolah": nama_sekolah,
-            "nomor_penerimaan_pertama": str(baris.get("Nomor Penerimaan", "")).strip(),
-            "nomor_urut_pertama": str(baris.get(KOLOM_URUTAN_PERTAMA, "")).strip(),
-            "serial_number": serial_number,
-            "nama_koordinator": str(baris.get("Nama Koordinator", "")).strip(),
-            "_baris_sheet": int(baris["_baris_sheet"]),
-        }
-    )
-    st.session_state.scan_message = ("success", f"✅ BAPP berhasil ditambahkan — {nomor_transaksi} ({nama_sekolah})")
-
-
-def pastikan_nomor_penerimaan_unik(info):
-    """Dipanggil sebelum menyimpan BAPP PERTAMA suatu penerimaan baru saja.
-
-    Nomor Penerimaan digenerate di popup berdasarkan data yang di-cache
-    lokal di sesi browser masing-masing operator -- kalau 2 operator buka
-    popup "Buat Penerimaan Baru" hampir bersamaan sebelum salah satunya
-    sempat menyimpan BAPP pertamanya, keduanya bisa dapat Nomor Penerimaan
-    yang SAMA (bug tumpang tindih). Untuk mencegah ini, sebelum BAPP
-    pertama benar-benar disimpan, ambil dulu data TERBARU langsung dari
-    Spreadsheet dan cek apakah nomor tsb sudah lebih dulu dipakai operator
-    lain -- kalau iya, generate ulang nomor baru yang benar-benar masih
-    kosong.
-
-    Sengaja HANYA mengambil satu kolom (Nomor Penerimaan Baru) lewat
-    ws.col_values(), BUKAN refresh_master_data() yang menarik ulang
-    seluruh isi sheet (~15rb baris semua kolom) -- supaya tetap cepat,
-    tidak bikin lemot tiap kali BAPP pertama di-scan.
-
-    Mengembalikan True kalau nomornya sempat diganti (supaya bisa diberi
-    tahu ke operator)."""
-    ws = get_worksheet()
-    idx = _header_dan_idx_kolom_tulis()
-    nilai_kolom = _panggil_dengan_retry(lambda: ws.col_values(idx[KOLOM_NOMOR_BARU]))
-
-    nomor_sekarang = str(info.get("nomor_penerimaan", "")).strip()
-    sudah_dipakai = any(str(v).strip() == nomor_sekarang for v in nilai_kolom)
-
-    if sudah_dipakai:
-        termin = get_setting("termin_penerimaan", "2")
-        prefix = f"{info['direktorat'].upper()}{termin}-"
-        max_urut = 0
-        for v in nilai_kolom:
-            v = str(v).strip()
-            if v.startswith(prefix):
-                suffix = v[len(prefix):]
-                if suffix.isdigit():
-                    max_urut = max(max_urut, int(suffix))
-        nomor_baru = f"{prefix}{max_urut + 1:03d}"
-        info["nomor_penerimaan"] = nomor_baru
-        st.session_state.penerimaan_aktif["nomor_penerimaan"] = nomor_baru
-        return True
-    return False
-
-
-def handle_scan_input():
-    nomor = st.session_state.input_scan.strip()
-    st.session_state.input_scan = ""
-    if not nomor:
-        return
-
-    jumlah_sebelum = len(st.session_state.scan_list)
-    proses_scan(nomor)
-    if len(st.session_state.scan_list) <= jumlah_sebelum:
-        return  # ditolak (tidak ditemukan/duplikat) -- tidak ada yg perlu ditulis
-
-    # berhasil masuk ke list lokal -> langsung tulis ke Spreadsheet sbg OPEN
-    info = st.session_state.get("penerimaan_aktif")
-    urutan_baru = len(st.session_state.scan_list)
-    item_baru = st.session_state.scan_list[-1]
-    try:
-        if urutan_baru == 1:
-            # BAPP pertama di penerimaan ini -- cek dulu supaya nomornya
-            # tidak tumpang tindih dengan operator lain (lihat docstring
-            # pastikan_nomor_penerimaan_unik).
-            with st.spinner("Memastikan Nomor Penerimaan unik..."):
-                nomor_diganti = pastikan_nomor_penerimaan_unik(info)
-            if nomor_diganti:
-                st.toast(
-                    f"Nomor Penerimaan diperbarui jadi {info['nomor_penerimaan']} -- "
-                    f"nomor sebelumnya barusan dipakai operator lain.",
-                    icon="ℹ️",
-                )
-        with st.spinner("Menyimpan ke Spreadsheet..."):
-            catat_scan_ke_spreadsheet(item_baru, info, urutan_baru)
-    except Exception as e:
-        # gagal tersimpan -> batalkan penambahan di list lokal juga, supaya
-        # yang tampil di layar selalu sama dengan yang benar-benar tersimpan
-        st.session_state.scan_list.pop()
-        st.session_state.scan_message = (
-            "error",
-            f"BAPP gagal tersimpan ke Spreadsheet: {_pesan_error_ramah(e)} Silakan scan ulang.",
-        )
-
-
-def autofocus_scan_input():
-    components.html(
-        """
-        <script>
-        setTimeout(function() {
-            const doc = window.parent.document;
-            const input = doc.querySelector('input[aria-label="scan_nomor_transaksi"]');
-            if (input) { input.focus(); }
-        }, 150);
-        </script>
-        """,
-        height=0,
-    )
-
-
-def tambah_nama_hari(tanggal_str):
-    """Menambahkan nama hari Indonesia di depan tanggal format DD/MM/YYYY,
-    mis. '15/09/2026' -> 'Selasa, 15/09/2026'. Kalau formatnya tidak
-    dikenali, kembalikan tanggal apa adanya (bukan error)."""
-    try:
-        tgl = datetime.strptime(str(tanggal_str).strip(), "%d/%m/%Y")
-        return f"{NAMA_HARI_ID[tgl.weekday()]}, {tanggal_str}"
-    except Exception:
-        return tanggal_str
-
-
-def buat_sel_barcode(nilai, style_teks=None):
-    """
-    Barcode Penerimaan ditampilkan sebagai TEKS biasa,
-    bukan barcode gambar.
-    """
-
-    teks = str(nilai).strip()
-
-    if not teks:
-        teks = "-"
-
-    if style_teks:
-        return Paragraph(teks, style_teks)
-
-    return teks
-
-
-# =====================================================================
-# CETAK PDF PENERIMAAN
-# =====================================================================
-
-class NumberedCanvas(pdfcanvas.Canvas):
-    def __init__(self, *args, **kwargs):
-        pdfcanvas.Canvas.__init__(self, *args, **kwargs)
-        self._saved_page_states = []
-
-    def showPage(self):
-        self._saved_page_states.append(dict(self.__dict__))
-        self._startPage()
-
-    def save(self):
-        total_halaman = len(self._saved_page_states)
-        for state in self._saved_page_states:
-            self.__dict__.update(state)
-            self._gambar_nomor_halaman(total_halaman)
-            pdfcanvas.Canvas.showPage(self)
-        pdfcanvas.Canvas.save(self)
-
-    def _gambar_nomor_halaman(self, total_halaman):
-        self.setFont("Helvetica", 8)
-        lebar_halaman = self._pagesize[0]
-        self.drawRightString(
-            lebar_halaman - 1 * cm,
-            1.1 * cm,
-            f"Halaman {self._pageNumber} dari {total_halaman}"
-        )
-
-
-def buat_pdf_penerimaan(info, tabel_df):
-    """
-    Membuat PDF Bukti Penerimaan BAPP.
-
-    Layout:
-    - Portrait A4 (21 x 29,7 cm)
-    - Maksimal 40 BAPP per lembar
-    - Layout dibuat lebih lega seperti format referensi
-    - Tidak menggunakan PageBreak yang dapat menyebabkan halaman kosong
-    - Tanda tangan hanya di halaman terakhir
-    - Ringkasan bundle (Nomor Penerimaan Pertama) hanya di halaman terakhir,
-      dihitung dari SELURUH BAPP di penerimaan ini -- supaya Tim Sortir tahu
-      bundle apa saja yang perlu dicari.
-    """
-    buffer = io.BytesIO()
-
-    # ================================================================
-    # UKURAN KERTAS
-    # ================================================================
-    PAGE_W, PAGE_H = KERTAS_PRINT
-
-    # Margin dibuat cukup lega agar hasil mirip format referensi.
-    margin_left = 1.25 * cm
-    margin_right = 1.25 * cm
-    margin_top = 0.85 * cm
-    margin_bottom = 0.9 * cm
-
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=KERTAS_PRINT,
-        topMargin=margin_top,
-        bottomMargin=margin_bottom,
-        leftMargin=margin_left,
-        rightMargin=margin_right,
-        title="BUKTI PENERIMAAN BAPP TAHAP 2",
-        author="PT. PYX SOLUSI TEKNOLOGI",
-    )
-
-    styles = getSampleStyleSheet()
-
-    # ================================================================
-    # STYLE
-    # ================================================================
-    judul_style = ParagraphStyle(
-        "JudulBAPP",
-        parent=styles["Title"],
-        fontName="Helvetica-Bold",
-        fontSize=14,
-        leading=15,
-        spaceBefore=0,
-        spaceAfter=6,
-        alignment=1,
-    )
-
-    sel_style = ParagraphStyle(
-        "SelBAPP",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=6.3,
-        leading=6.5,
-        alignment=1,
-        spaceBefore=0,
-        spaceAfter=0,
-    )
-
-    header_sel_style = ParagraphStyle(
-        "HeaderBAPP",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.2,
-        leading=7.4,
-        alignment=1,
-        spaceBefore=0,
-        spaceAfter=0,
-    )
-
-    info_label_style = ParagraphStyle(
-        "InfoLabelBAPP",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=10,
-        leading=10.5,
-        alignment=0,
-        spaceBefore=0,
-        spaceAfter=0,
-    )
-
-    info_value_style = ParagraphStyle(
-        "InfoValueBAPP",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=10,
-        leading=10.5,
-        alignment=0,
-        spaceBefore=0,
-        spaceAfter=0,
-    )
-
-    judul_ringkasan_style = ParagraphStyle(
-        "JudulRingkasanBAPP",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=10.5,
-        leading=11.5,
-        spaceBefore=0,
-        spaceAfter=4,
-        alignment=1,
-    )
-
-    def sel(txt):
-        nilai = str(txt).strip()
-        if not nilai:
-            nilai = "-"
-        return Paragraph(nilai, sel_style)
-
-    def header_sel(txt):
-        return Paragraph(str(txt), header_sel_style)
-
-    def info_label(txt):
-        return Paragraph(str(txt), info_label_style)
-
-    def info_value(txt):
-        nilai = str(txt).strip() if txt is not None else "-"
-        if not nilai:
-            nilai = "-"
-        return Paragraph(nilai, info_value_style)
-
-    # ================================================================
-    # TANGGAL
-    # ================================================================
-    tanggal_saja = (
-        str(info.get("waktu", "")).split(" ")[0]
-        if info.get("waktu")
-        else "-"
-    )
-
-    # ================================================================
-    # LEBAR TABEL
-    #
-    # Total = 20.8 cm (disesuaikan untuk A4 portrait).
-    # Kolom Nomor Urut & Nama Koordinator dihapus (tidak dicetak lagi),
-    # lebarnya dibagi ulang ke kolom lain -- termasuk Tanggal BAPP yang
-    # sekarang lebih lebar karena menampilkan nama hari juga.
-    # ================================================================
-    # Lebar total = 18,5 cm, pas dengan area cetak A4
-    # (A4 21 cm dikurangi margin kiri dan kanan masing-masing 1,25 cm).
-    # Jangan melebihi 18,5 cm agar tabel tidak menempel/keluar margin.
-    lebar_kolom = [
-        0.60 * cm,   # No
-        3.00 * cm,   # Nomor Transaksi
-        1.20 * cm,   # NPSN
-        4.00 * cm,   # Nama Sekolah
-        2.30 * cm,   # Tanggal BAPP (+ nama hari)
-        1.60 * cm,   # Barcode Penerimaan
-        1.60 * cm,   # Nomor Penerimaan 1
-        4.20 * cm,   # Serial Number
-    ]
-
-    # ================================================================
-    # RINGKASAN BUNDLE ASAL (dihitung SEKALI dari seluruh tabel_df,
-    # dipakai nanti di halaman terakhir saja)
-    # ================================================================
-    if "Nomor Penerimaan Pertama" in tabel_df.columns:
-        ringkasan_bundle = (
-            tabel_df["Nomor Penerimaan Pertama"]
-            .value_counts()
-            .reset_index()
-        )
-        ringkasan_bundle.columns = ["Nomor Penerimaan Pertama", "Jumlah BAPP"]
-        ringkasan_bundle = ringkasan_bundle.sort_values("Nomor Penerimaan Pertama")
-    else:
-        ringkasan_bundle = pd.DataFrame(columns=["Nomor Penerimaan Pertama", "Jumlah BAPP"])
-
-    # ================================================================
-    # DATA / JUMLAH HALAMAN
-    # ================================================================
-    total_baris = len(tabel_df)
-
-    total_lembar = max(
-        1,
-        -(-total_baris // BAPP_PER_LEMBAR_PRINT)
-    )
-
-    flow = []
-
-    # ================================================================
-    # LOOP HALAMAN
-    # ================================================================
-    # Bukti Penerimaan BAPP dicetak 2 kali berturut-turut (2 rangkap) dalam
-    # SATU file PDF yang sama, supaya operator tidak perlu print manual 2x.
-    jumlah_rangkap = 2
-    for rangkap in range(jumlah_rangkap):
-        for lembar in range(total_lembar):
-
-            mulai = lembar * BAPP_PER_LEMBAR_PRINT
-            selesai = (lembar + 1) * BAPP_PER_LEMBAR_PRINT
-            potongan = tabel_df.iloc[mulai:selesai]
-
-            # ------------------------------------------------------------
-            # JUDUL
-            # ------------------------------------------------------------
-            flow.append(
-                Paragraph(
-                    "BUKTI PENERIMAAN BAPP TAHAP 2",
-                    judul_style
-                )
-            )
-
-            # ------------------------------------------------------------
-            # INFO PENERIMAAN
-            # ------------------------------------------------------------
-            info_rows = [
-                [
-                    info_label("Nomor Penerimaan"),
-                    info_value(":"),
-                    info_value(info.get("nomor_penerimaan") or "-"),
-                    info_label("Tanggal"),
-                    info_value(":"),
-                    info_value(tanggal_saja),
-                ],
-                [
-                    info_label("Pengirim"),
-                    info_value(":"),
-                    info_value(info.get("pengirim") or "-"),
-                    info_label("PIC Penerimaan"),
-                    info_value(":"),
-                    info_value(info.get("pic") or "-"),
-                ],
-                [
-                    info_label("Direktorat"),
-                    info_value(":"),
-                    info_value(info.get("direktorat") or "-"),
-                    info_label("Jumlah BAPP"),
-                    info_value(":"),
-                    info_value(str(info.get("jumlah", ""))),
-                ],
-            ]
-
-            t_info = Table(
-                info_rows,
-                colWidths=[
-                    2.35 * cm,
-                    0.25 * cm,
-                    6.35 * cm,
-                    2.35 * cm,
-                    0.25 * cm,
-                    6.35 * cm,
-                ],
-                rowHeights=[
-                    0.62 * cm,
-                    0.62 * cm,
-                    0.62 * cm,
-                ],
-            )
-
-            t_info.setStyle(
-                TableStyle([
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("ALIGN", (1, 0), (1, -1), "CENTER"),
-                    ("ALIGN", (4, 0), (4, -1), "CENTER"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 1),
-                    ("TOPPADDING", (0, 0), (-1, -1), 0),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ])
-            )
-
-            flow.append(t_info)
-
-            # Jarak pendek sebelum tabel.
-            flow.append(Spacer(1, 0.42 * cm))
-
-            # ------------------------------------------------------------
-            # HEADER TABEL
-            # ------------------------------------------------------------
-            header_tabel = [
-                header_sel(t)
-                for t in [
-                    "No",
-                    "Nomor Transaksi",
-                    "NPSN",
-                    "Nama Sekolah",
-                    "Tanggal BAPP",
-                    "Barcode<br/>Penerimaan",
-                    "Nomor<br/>Penerimaan 1",
-                    "Serial Number",
-                ]
-            ]
-
-            data_tabel = [header_tabel]
-
-            # ------------------------------------------------------------
-            # ISI TABEL
-            # ------------------------------------------------------------
-            for _, r in potongan.iterrows():
-                data_tabel.append([
-                    sel(r["Nomor"]),
-                    sel(r["Nomor Transaksi"]),
-                    sel(r["NPSN"]),
-                    sel(r["Nama Sekolah"]),
-                    sel(tambah_nama_hari(r["Tanggal BAPP"])),
-                    buat_sel_barcode(
-                        r["Barcode Penerimaan"],
-                        style_teks=sel_style
-                    ),
-                    sel(r["Nomor Penerimaan Pertama"]),
-                    sel(r["Serial Number"]),
-                ])
-
-            # ------------------------------------------------------------
-            # TABEL
-            #
-            # Tinggi 0.55 cm x 40 = 22 cm (disesuaikan naik karena font
-            # tabel diperbesar dari 5.6pt ke 7.5pt).
-            # ------------------------------------------------------------
-            row_heights = [0.85 * cm] + [
-                0.55 * cm for _ in range(len(potongan))
-            ]
-
-            t = Table(
-                data_tabel,
-                colWidths=lebar_kolom,
-                rowHeights=row_heights,
-                repeatRows=1,
-                splitByRow=1,
-                hAlign="CENTER",
-            )
-
-            t.setStyle(
-                TableStyle([
-                    # Header
-                    (
-                        "BACKGROUND",
-                        (0, 0),
-                        (-1, 0),
-                        colors.HexColor("#e5e7eb")
-                    ),
-                    (
-                        "TEXTCOLOR",
-                        (0, 0),
-                        (-1, 0),
-                        colors.HexColor("#111827")
-                    ),
-
-                    # Grid
-                    (
-                        "GRID",
-                        (0, 0),
-                        (-1, -1),
-                        0.4,
-                        colors.HexColor("#111827")
-                    ),
-
-                    # Font
-                    (
-                        "FONTNAME",
-                        (0, 1),
-                        (-1, -1),
-                        "Helvetica"
-                    ),
-                    (
-                        "FONTSIZE",
-                        (0, 1),
-                        (-1, -1),
-                        7.5
-                    ),
-
-                    # Padding
-                    (
-                        "TOPPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        0
-                    ),
-                    (
-                        "BOTTOMPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        0
-                    ),
-                    (
-                        "LEFTPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        1
-                    ),
-                    (
-                        "RIGHTPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        1
-                    ),
-
-                    # Alignment
-                    (
-                        "ALIGN",
-                        (0, 0),
-                        (-1, -1),
-                        "CENTER"
-                    ),
-                    (
-                        "VALIGN",
-                        (0, 0),
-                        (-1, -1),
-                        "MIDDLE"
-                    ),
-                ])
-            )
-
-            flow.append(t)
-
-            # ------------------------------------------------------------
-            # TANDA TANGAN - HANYA HALAMAN TERAKHIR
-            # ------------------------------------------------------------
-            if lembar == total_lembar - 1:
-
-                flow.append(Spacer(1, 1.0 * cm))
-
-                pengirim_label = (
-                    info.get("pengirim")
-                    or "..........................."
-                )
-
-                pic_label = (
-                    info.get("pic")
-                    or "..........................."
-                )
-
-                kolom_kosong = "(" + " " * 18 + ")"
-
-                ttd_rows = [
-                    [
-                        "Pengirim",
-                        "",
-                        "Tim Sortir",
-                        "",
-                        "Tim Scan",
-                        "",
-                        "PIC Penerimaan"
-                    ],
-                    [
-                        "", "", "", "", "", "", ""
-                    ],
-                    [
-                        "", "", "", "", "", "", ""
-                    ],
-                    [
-                        f"({pengirim_label})",
-                        "",
-                        kolom_kosong,
-                        "",
-                        kolom_kosong,
-                        "",
-                        f"({pic_label})"
-                    ],
-                ]
-
-                t_ttd = Table(
-                    ttd_rows,
-                    colWidths=[
-                        3.95 * cm,
-                        0.65 * cm,
-                        3.95 * cm,
-                        0.65 * cm,
-                        3.95 * cm,
-                        0.65 * cm,
-                        3.95 * cm,
-                    ],
-                    rowHeights=[
-                        0.55 * cm,
-                        1.8 * cm,
-                        0.45 * cm,
-                        0.55 * cm,
-                    ],
-                    hAlign="CENTER",
-                )
-
-                t_ttd.setStyle(
-                    TableStyle([
-                        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-                        ("FONTNAME", (2, 0), (2, 0), "Helvetica-Bold"),
-                        ("FONTNAME", (4, 0), (4, 0), "Helvetica-Bold"),
-                        ("FONTNAME", (6, 0), (6, 0), "Helvetica-Bold"),
-                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                        ("TOPPADDING", (0, 0), (-1, -1), 0),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                    ])
-                )
-
-                flow.append(t_ttd)
-                flow.append(Spacer(1, 0.35 * cm))
-
-            # ------------------------------------------------------------
-            # RINGKASAN BUNDLE ASAL (Nomor Penerimaan Pertama) -- HANYA
-            # HALAMAN TERAKHIR. Dihitung dari SELURUH BAPP di penerimaan
-            # ini (bukan cuma yang ada di halaman terakhir), supaya Tim
-            # Sortir tahu bundle apa saja yang perlu dicari & berapa
-            # banyak BAPP dari masing-masing bundle itu.
-            # ------------------------------------------------------------
-
-
-            # ------------------------------------------------------------
-            # PAGE BREAK
-            #
-            # PageBreak hanya diberikan kalau memang masih ada halaman
-            # berikutnya. Karena tabel sekarang dibuat cukup pendek,
-            # tidak akan terjadi split tabel -> PageBreak ganda.
-            # ------------------------------------------------------------
-            if lembar < total_lembar - 1:
-                flow.append(PageBreak())
-            elif rangkap < jumlah_rangkap - 1:
-                flow.append(PageBreak())
-
-    # ====================================================================
-    # RINGKASAN BUNDLE ASAL -- HANYA SATU KALI, di halaman paling akhir
-    # (setelah KEDUA rangkap Bukti Penerimaan BAPP selesai dicetak).
-    # ====================================================================
-    if not ringkasan_bundle.empty:
-
-        flow.append(PageBreak())
-        flow.append(Spacer(1, 0.35 * cm))
-        flow.append(
-            Paragraph(
-                "Ringkasan Bundle Asal (untuk Tim Sortir)",
-                judul_ringkasan_style
-            )
-        )
-        flow.append(Spacer(1, 0.45 * cm))
-
-        # Informasi penerimaan pada halaman ringkasan bundle
-        info_ringkasan_rows = [
-            [info_label("Nomor Penerimaan"), info_value(info.get("nomor_penerimaan") or "-"), info_label("Tanggal"), info_value(tanggal_saja)],
-            [info_label("Pengirim"), info_value(info.get("pengirim") or "-"), info_label("PIC Penerimaan"), info_value(info.get("pic") or "-")],
-            [info_label("Direktorat"), info_value(info.get("direktorat") or "-"), info_label("Jumlah BAPP"), info_value(str(info.get("jumlah", "")))],
-        ]
-        flow.append(
-            Table(
-                info_ringkasan_rows,
-                colWidths=[3.0 * cm, 6.0 * cm, 3.0 * cm, 6.0 * cm],
-                rowHeights=[0.85 * cm, 0.85 * cm, 0.85 * cm],
-                hAlign="CENTER",
-                style=TableStyle([
-                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                    ("TOPPADDING", (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                ])
-            )
-        )
-        flow.append(Spacer(1, 0.55 * cm))
-
-        # ------------------------------------------------------------
-        # RINGKASAN PER DIREKTORAT
-        # ------------------------------------------------------------
-        if "Direktorat" in tabel_df.columns:
-            if "Nomor Penerimaan Pertama" in tabel_df.columns:
-                ringkasan_direktorat = (
-                    tabel_df.groupby("Direktorat", dropna=False)
-                    .agg(
-                        **{
-                            "Jumlah Bundle": ("Nomor Penerimaan Pertama", "nunique"),
-                            "Jumlah BAPP": ("Nomor Penerimaan Pertama", "size"),
-                        }
-                    )
-                    .reset_index()
-                )
-            else:
-                ringkasan_direktorat = (
-                    tabel_df.groupby("Direktorat", dropna=False)
-                    .size()
-                    .reset_index(name="Jumlah BAPP")
-                )
-                ringkasan_direktorat["Jumlah Bundle"] = 0
-
-            ringkasan_direktorat["Direktorat"] = (
-                ringkasan_direktorat["Direktorat"]
-                .fillna("-")
-                .astype(str)
-            )
-            ringkasan_direktorat = ringkasan_direktorat.sort_values("Direktorat")
-
-            flow.append(
-                Paragraph(
-                    "Summary Per Direktorat",
-                    judul_ringkasan_style
-                )
-            )
-            flow.append(Spacer(1, 0.25 * cm))
-
-            direktorat_rows = [["Direktorat", "Jumlah Bundle", "Jumlah BAPP"]]
-            for _, r in ringkasan_direktorat.iterrows():
-                direktorat_rows.append([
-                    str(r["Direktorat"]),
-                    str(int(r["Jumlah Bundle"])),
-                    str(int(r["Jumlah BAPP"])),
-                ])
-
-            t_direktorat = Table(
-                direktorat_rows,
-                colWidths=[6.0 * cm, 3.5 * cm, 3.5 * cm],
-                hAlign="CENTER",
-                repeatRows=1,
-            )
-
-            t_direktorat.setStyle(
-                TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e5e7eb")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                    ("TOPPADDING", (0, 0), (-1, -1), 4),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#111827")),
-                ])
-            )
-
-            flow.append(t_direktorat)
-            flow.append(Spacer(1, 0.65 * cm))
-
-        # ------------------------------------------------------------
-        # RINGKASAN JUMLAH BUNDLE
-        # ------------------------------------------------------------
-        ringkasan_rows = [["Nomor Bundle", "Jumlah BAPP"]]
-        for _, r in ringkasan_bundle.iterrows():
-            ringkasan_rows.append([
-                str(r["Nomor Penerimaan Pertama"]),
-                str(r["Jumlah BAPP"]),
-            ])
-
-        t_ringkasan = Table(
-            ringkasan_rows,
-            colWidths=[6 * cm, 3 * cm],
-            hAlign="CENTER",
-            repeatRows=1,
-        )
-
-        t_ringkasan.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e5e7eb")),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#111827")),
-            ])
-        )
-
-        flow.append(t_ringkasan)
-        flow.append(Spacer(1, 0.65 * cm))
-
-
-
-    # ================================================================
-    # BUILD
-    # ================================================================
-    doc.build(
-        flow,
-        canvasmaker=NumberedCanvas
-    )
-
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# =====================================================================
-# 7. KOMPONEN TAMPILAN KECIL (card, badge)
-# =====================================================================
-
-def render_metric_card(label, value, icon=""):
-    st.markdown(
-        f"""
-        <div style="background:#ffffff;border-radius:14px;padding:16px 18px;
-                    box-shadow:0 1px 3px rgba(0,0,0,0.08);border:1px solid #eef0f2;">
-            <div style="font-size:12.5px;color:#6b7280;margin-bottom:6px;">{icon} {label}</div>
-            <div style="font-size:24px;font-weight:700;color:#111827;">{value}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_badge(teks, warna="abu"):
-    palet = {
-        "hijau": ("#166534", "#dcfce7"),
-        "kuning": ("#92400e", "#fef3c7"),
-        "abu": ("#374151", "#f3f4f6"),
-        "biru": ("#1d4ed8", "#dbeafe"),
-    }
-    fg, bg = palet.get(warna, palet["abu"])
-    return (
-        f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:999px;'
-        f'font-size:12px;font-weight:600;white-space:nowrap;">{teks}</span>'
-    )
-
-
-def render_tombol_pdf(pdf_bytes, nama_file):
-    """Menampilkan 2 tombol berdampingan (Print + Unduh) dalam SATU
-    blok HTML yang sama, supaya ukuran & posisinya simetris persis -- kalau
-    salah satu pakai tombol Streamlit asli dan satunya custom HTML, tingginya
-    suka beda sedikit dan jadi tidak sejajar.
-
-    Keduanya pakai teknik Blob URL lewat JavaScript (bukan link data: biasa) --
-    browser modern seperti Chrome/Edge tidak lagi membuka PDF langsung dari
-    link data:application/pdf;base64,... (yang muncul cuma teks base64 mentah).
-    Blob URL didukung penuh baik untuk dicetak melalui dialog print maupun diunduh."""
-    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-    components.html(
-        f"""
-        <div style="display:flex; gap:0.75rem; width:100%; font-family:inherit;">
-            <button id="btnPreviewPdf" style="
-                flex:1; height:2.6rem; border-radius:10px; border:1px solid #d1d5db;
-                background-color:#ffffff; color:#111827; font-weight:500; cursor:pointer;
-                font-family:inherit; font-size:0.95rem;
-            ">👁️ Print PDF</button>
-            <button id="btnUnduhPdf" style="
-                flex:1; height:2.6rem; border-radius:10px; border:1px solid #2563eb;
-                background-color:#2563eb; color:#ffffff; font-weight:500; cursor:pointer;
-                font-family:inherit; font-size:0.95rem;
-            ">⬇️ Unduh PDF</button>
-        </div>
-        <script>
-        const base64Data = "{b64}";
-        function buatBlobPdf() {{
-            const byteChars = atob(base64Data);
-            const byteNumbers = new Array(byteChars.length);
-            for (let i = 0; i < byteChars.length; i++) {{
-                byteNumbers[i] = byteChars.charCodeAt(i);
-            }}
-            const byteArray = new Uint8Array(byteNumbers);
-            return new Blob([byteArray], {{ type: "application/pdf" }});
-        }}
-        document.getElementById("btnPreviewPdf").addEventListener("click", function() {{
-            const blobUrl = URL.createObjectURL(buatBlobPdf());
-            window.open(blobUrl, "_blank");
-        }});
-        document.getElementById("btnUnduhPdf").addEventListener("click", function() {{
-            const blobUrl = URL.createObjectURL(buatBlobPdf());
-            const a = document.createElement("a");
-            a.href = blobUrl;
-            a.download = "{nama_file}";
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        }});
-        </script>
-        """,
-        height=55,
-    )
-
-
-NAMA_BULAN_ID = {
-    1: "Januari", 2: "Februari", 3: "Maret", 4: "April", 5: "Mei", 6: "Juni",
-    7: "Juli", 8: "Agustus", 9: "September", 10: "Oktober", 11: "November", 12: "Desember",
+    return clean(value)
+
+DB_SHEET_ID = _setting("DB_SHEET_ID")
+MASTER_SHEET_ID = _setting("MASTER_SHEET_ID")
+MASTER_SHEET_WORKSHEET_NAME = _setting("MASTER_SHEET_WORKSHEET_NAME", "data")
+GOOGLE_SERVICE_ACCOUNT_FILE = _setting("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+DRIVE_ROOT_FOLDER_ID = _setting("DRIVE_ROOT_FOLDER_ID")
+ADMIN_PASSWORD = _setting("ADMIN_PASSWORD")
+ADMIN_EMAIL = _setting("ADMIN_EMAIL")
+APP_TITLE = "Form Perpindahan Dokumen BAPP"
+
+# Nama tab yang dibuat OTOMATIS di spreadsheet DB_SHEET_ID (boleh sama dengan
+
+# MASTER_SHEET_ID kalau digabung jadi satu spreadsheet).
+
+TAB_MASTER_BUNDLE = "master_bundle"
+TAB_TRANSAKSI = "transaksi_perpindahan"
+TAB_DETAIL = "detail_perpindahan"
+TAB_RIWAYAT = "riwayat_lokasi_bundle"
+TAB_HEADERS = {
+TAB_MASTER_BUNDLE: ["nomor_bundle", "direktorat", "jumlah_bapp", "lokasi_saat_ini", "waktu", "status"],
+TAB_TRANSAKSI: [
+"id_transaksi", "tanggal", "waktu", "nama_pengirim", "nama_penerima",
+"dari_lokasi", "ke_lokasi", "jumlah_bundle", "total_bapp", "status",
+"drive_folder_id", "drive_folder_url", "created_at",
+],
+TAB_DETAIL: ["id_transaksi", "nomor_bundle", "direktorat", "jumlah_bapp"],
+TAB_RIWAYAT: ["nomor_bundle", "dari_lokasi", "ke_lokasi", "waktu", "id_transaksi"],
 }
 
+# PENTING: kalau tab transaksi_perpindahan / detail_perpindahan versi LAMA
 
-def format_tanggal_indonesia(tanggal):
-    """Format tanggal manual ke Bahasa Indonesia (mis. '03 September 2026'),
-    tidak bergantung pada locale sistem operasi (yang di banyak komputer
-    Windows default-nya Inggris, jadi %B akan salah menampilkan nama bulan)."""
-    return f"{tanggal.day:02d} {NAMA_BULAN_ID[tanggal.month]} {tanggal.year}"
+# (sebelum ada nama_pengirim/nama_penerima/direktorat) masih ada di
 
+# spreadsheet Anda, HAPUS dulu tab itu secara manual di Google Sheets
 
-# =====================================================================
-# 8. POPUP / DIALOG
-# =====================================================================
+# (klik kanan tab -> Delete) sebelum pakai versi ini, supaya tab baru dibuat
 
-@st.dialog("BUAT PENERIMAAN BARU")
-def dialog_buat_penerimaan():
-    # Placeholder di posisi paling atas (sesuai mockup), isinya baru ditentukan
-    # setelah Direktorat diketahui di bawah -- st.empty() memungkinkan ini.
-    nomor_placeholder = st.empty()
+# otomatis dengan header yang benar. Tab master_bundle & riwayat_lokasi_bundle
 
-    nama_pengirim = st.text_input("Nama Pengirim", key="dlg_pengirim")
+# TIDAK perlu dihapus, strukturnya tidak berubah.
 
-    opsi_direktorat = get_daftar_direktorat() + ["Lainnya (isi manual)"]
-    pilihan_direktorat = st.selectbox("Direktorat", opsi_direktorat, key="dlg_direktorat_pilihan")
-    if pilihan_direktorat == "Lainnya (isi manual)":
-        direktorat = st.text_input("Ketik kode Direktorat", key="dlg_direktorat_manual").strip().upper()
-    else:
-        direktorat = pilihan_direktorat
+# Pemetaan kolom Master BAPP: nama internal -> judul kolom PERSIS di spreadsheet.
 
-    tanggal_penerimaan = st.date_input("Tanggal Penerimaan", value=datetime.now().date(), key="dlg_tanggal")
-    pic_penerimaan = st.text_input("PIC Penerimaan", key="dlg_pic")
+COLUMN_MAP = {
+"status_bapp_fisik": "Status BAPP Fisik",
+"waktu_bapp_diterima": "Waktu BAPP diterima",
+"nomor_penerimaan": "Nomor Penerimaan",
+"nomor_urut_penerimaan": "Nomor Urut Penerimaan",
+"barcode_penerimaan": "Barcode Penerimaan",
+"status_bapp_fisik_kedua": "Status BAPP Fisik Kedua",
+"waktu_bapp_diterima_baru": "Waktu BAPP diterima Baru",
+"nomor_penerimaan_baru": "Nomor Penerimaan Baru",
+"nomor_transaksi": "Nomor Transaksi",
+"serial_number": "Serial Number",
+"npsn": "NPSN",
+"nama_sekolah": "Nama Sekolah",
+"termin": "Termin",
+"provinsi": "Provinsi",
+"kabupaten_kota": "Kabupaten/Kota",
+"direktorat": "Direktorat",
+"status": "Status",
+"tanggal_bapp": "Tanggal BAPP",
+"nomor_map": "Nomor MAP",
+"nama_koordinator": "Nama Koordinator",
+"nama_pengirim": "Nama Pengirim",
+"pic_pengirim": "PIC Pengirim",
+"nomor_urut_penerimaan_baru": "Nomor Urut Penerimaan Baru",
+"pic_penerimaan": "PIC Penerimaan",
+"korwil_penerimaan_bapp_baru": "Korwil Penerimaan BAPP Baru",
+"timestamp_penerimaan_baru": "Timestamp Penerimaan Baru",
+# Nomor bundle = "Nomor Penerimaan Baru" (semua BAPP dengan nilai sama di
+# kolom ini dianggap satu bundle fisik). Ganti kalau kolom Anda berbeda.
+"nomor_bundle": "Nomor Penerimaan Baru",
+}
 
-    nomor_preview = generate_nomor_penerimaan(direktorat) if direktorat else "-"
-    # Sengaja TANPA key= -- field ini cuma tampilan (disabled), nilainya harus
-    # ikut berubah setiap kali Direktorat diganti. Kalau pakai key, Streamlit
-    # akan mempertahankan nilai lama dari session_state dan mengabaikan
-    # parameter value= yang baru (ini penyebab bug "nomor tidak ikut berubah").
-    nomor_placeholder.text_input("Nomor Penerimaan 🔒", value=nomor_preview, disabled=True)
+# Nilai di kolom "Status BAPP Fisik Kedua" yang berarti bundle sudah siap
 
-    st.markdown("")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("BATAL", use_container_width=True):
-            st.rerun()
-    with c2:
-        siap = bool(direktorat and nama_pengirim.strip() and pic_penerimaan.strip())
-        if st.button("LANJUT", type="primary", use_container_width=True, disabled=not siap):
-            st.session_state.penerimaan_aktif = {
-                "nomor_penerimaan": nomor_preview,
-                "direktorat": direktorat,
-                "nama_pengirim": nama_pengirim.strip(),
-                "tanggal": tanggal_penerimaan,
-                "pic": pic_penerimaan.strip(),
-                # Timestamp presisi saat folder ini DIBUAT -- dipakai untuk
-                # mengurutkan Daftar Penerimaan BAPP sesuai urutan pembuatan
-                # yang sebenarnya (lihat KOLOM_TIMESTAMP_URUT).
-                "waktu_buat": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f"),
-            }
-            st.session_state.scan_list = []
-            st.session_state.scan_message = None
-            st.session_state.halaman = "form_baru"
-            st.rerun()
+# dianggap masuk Tim Gate.
 
+STATUS_AWAL_TIM_GATE = {"Open", "Diterima"}
 
-def buka_dialog_penerimaan_baru():
-    """Bersihkan field popup sebelum dibuka, supaya tidak ada data yang
-    'nyangkut' dari percobaan sebelumnya (mis. setelah klik BATAL). Kalau ada
-    penerimaan OPEN yang sedang aktif dikerjakan di sesi ini, arahkan ke sana
-    dulu (datanya sendiri sudah aman tersimpan di Spreadsheet, tapi baiknya
-    diselesaikan/ditutup dulu sebelum mulai penerimaan lain)."""
-    if st.session_state.get("scan_list") and st.session_state.get("penerimaan_aktif"):
-        st.session_state.halaman = "form_baru"
-        st.toast("Ada penerimaan OPEN yang sedang dikerjakan -- selesaikan/tutup dulu.", icon="⚠️")
-        st.rerun()
-        return
-    for k in ("dlg_pengirim", "dlg_pic", "dlg_direktorat_manual", "dlg_direktorat_pilihan", "dlg_tanggal"):
-        st.session_state.pop(k, None)
-    dialog_buat_penerimaan()
+# Alur perpindahan wajib: key = lokasi asal, value = satu-satunya tujuan valid.
 
+ALUR_LOKASI = {"Tim Gate": "Tim SN", "Tim SN": "Tim Scan"}
+LOKASI_AWAL = "Tim Gate"
+DT_FORMAT = "%Y-%m-%d %H:%M:%S"
+SHEETS_SCOPES = [
+"https://www.googleapis.com/auth/spreadsheets",
+"https://www.googleapis.com/auth/drive",
+]
 
-@st.dialog("Hapus BAPP")
-def dialog_konfirmasi_hapus_bapp(idx):
-    item = st.session_state.scan_list[idx]
-    st.write("Apakah Anda yakin ingin menghapus BAPP ini dari penerimaan?")
-    st.caption(f"{item['nomor_transaksi']} — {item['nama_sekolah']}")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Batal", use_container_width=True):
-            st.rerun()
-    with c2:
-        if st.button("Hapus", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Menghapus..."):
-                    hapus_satu_baris_bapp(item)
-                del st.session_state.scan_list[idx]
-                st.session_state.scan_message = None
-                st.rerun()
-            except Exception as e:
-                st.error(f"Gagal menghapus: {_pesan_error_ramah(e)}")
+# =============================================================================
 
+# 2. KONEKSI GOOGLE SHEETS (dipakai sebagai "database")
 
-@st.dialog("Hapus Penerimaan")
-def dialog_konfirmasi_hapus_penerimaan(nomor):
-    st.write("Apakah Anda yakin ingin menghapus penerimaan ini?")
-    st.caption(f"Nomor Penerimaan: {nomor}")
-    st.warning("BAPP dalam penerimaan ini akan tersedia lagi untuk diterima ulang di penerimaan lain.")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Batal", use_container_width=True):
-            st.rerun()
-    with c2:
-        if st.button("Hapus", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Menghapus penerimaan..."):
-                    hapus_penerimaan(nomor)
-                st.session_state.halaman = "daftar"
-                st.rerun()
-            except Exception as e:
-                st.error(f"Gagal menghapus: {_pesan_error_ramah(e)}")
+# =============================================================================
 
+def _get_google_credentials(scopes):
+    """
+    Ambil credential Google dengan dua mode:
+        1. Streamlit Cloud: dari st.secrets["gcp_service_account"].
+    2. Lokal: dari file service_account.json (atau file yang ditentukan
+    GOOGLE_SERVICE_ACCOUNT_FILE).
 
-@st.dialog("Batalkan Penerimaan")
-def dialog_konfirmasi_batalkan_penerimaan():
-    """Membatalkan penerimaan yang masih OPEN. Karena tiap scan sudah langsung
-    tertulis ke Spreadsheet, ini juga mengosongkan kembali data yang sudah
-    sempat tersimpan (BAPP-nya jadi tersedia lagi untuk diterima ulang)."""
-    info = st.session_state.get("penerimaan_aktif") or {}
-    jumlah = len(st.session_state.scan_list)
-    st.write("Apakah Anda yakin ingin membatalkan penerimaan ini?")
-    if jumlah:
-        st.warning(f"{jumlah} BAPP yang sudah tersimpan pada penerimaan ini akan dikosongkan kembali (bisa diterima ulang di penerimaan lain).")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Batal", use_container_width=True):
-            st.rerun()
-    with c2:
-        if st.button("Ya, Batalkan", type="primary", use_container_width=True):
-            try:
-                if info.get("nomor_penerimaan"):
-                    with st.spinner("Membatalkan..."):
-                        hapus_penerimaan(info["nomor_penerimaan"])
-                st.session_state.scan_list = []
-                st.session_state.scan_message = None
-                st.session_state.penerimaan_aktif = None
-                st.session_state.halaman = "daftar"
-                st.rerun()
-            except Exception as e:
-                st.error(f"Gagal membatalkan: {_pesan_error_ramah(e)}")
+    Dengan pola ini service_account.json TIDAK perlu di-upload ke GitHub.
+    """
+    try:
+        if "gcp_service_account" in st.secrets:
+            service_account_info = dict(st.secrets["gcp_service_account"])
 
+            # TOML dapat menyimpan private_key dengan \n literal. google-auth
+            # membutuhkan newline yang sebenarnya.
+            if "private_key" in service_account_info:
+                service_account_info["private_key"] = str(
+                    service_account_info["private_key"]
+                ).replace("\\n", "\n")
 
-@st.dialog("Tutup Penerimaan")
-def dialog_konfirmasi_tutup_penerimaan(nomor):
-    st.write(
-        f"Apakah Anda yakin ingin menutup penerimaan **{nomor}**? Setelah ditutup, "
-        f"data tidak dapat diedit kembali dan seluruh BAPP akan ditandai sebagai DITERIMA."
-    )
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Batal", use_container_width=True):
-            st.rerun()
-    with c2:
-        if st.button("Ya, Tutup", type="primary", use_container_width=True):
-            try:
-                with st.spinner("Menutup penerimaan..."):
-                    tutup_penerimaan(nomor)
-                st.session_state.scan_list = []
-                st.session_state.scan_message = None
-                st.session_state.penerimaan_aktif = None
-                st.session_state.halaman = "detail"
-                st.session_state.detail_nomor = nomor
-                st.toast(f"Penerimaan {nomor} berhasil ditutup.", icon="✅")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Gagal menutup penerimaan: {_pesan_error_ramah(e)}")
-
-
-# =====================================================================
-# 9. INISIALISASI
-# =====================================================================
-
-init_db()
-
-if "master_df" not in st.session_state:
-    refresh_master_data()
-
-for key, default in [
-    ("scan_list", []),
-    ("scan_message", None),
-    ("halaman", "daftar"),
-    ("daftar_halaman_ke", 1),
-    ("penerimaan_aktif", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-if st.session_state.get("load_error"):
-    st.warning(f"⚠️ Gagal memuat data master dari Google Spreadsheet: {st.session_state.load_error}")
-
-
-def get_pdf_cache(nomor, info, tabel):
-    """Cache PDF per nomor penerimaan agar rerun Streamlit tidak membuat
-    ulang PDF yang sama berkali-kali. Cache dibersihkan saat master berubah."""
-    cache = st.session_state.setdefault("pdf_cache", {})
-    kunci = str(nomor)
-    cached = cache.get(kunci)
-    if cached is None:
-        pdf_bytes = buat_pdf_penerimaan(info, tabel)
-        cached = (pdf_bytes, base64.b64encode(pdf_bytes).decode("utf-8"))
-        cache[kunci] = cached
-    return cached
-
-
-# =====================================================================
-# 10. HALAMAN: DAFTAR PENERIMAAN BAPP
-# =====================================================================
-
-if st.session_state.halaman == "daftar":
-    c_judul, c_tombol, c_setting = st.columns([5, 2, 0.7])
-    with c_judul:
-        st.title("Daftar Penerimaan BAPP")
-        st.caption("Kelola dan pantau seluruh penerimaan BAPP")
-    with c_tombol:
-        st.write("")
-        if st.button("+ Buat Penerimaan Baru", type="primary", use_container_width=True):
-            buka_dialog_penerimaan_baru()
-    with c_setting:
-        st.write("")
-        if st.button("⚙️", use_container_width=True, help="Pengaturan"):
-            st.session_state.halaman = "pengaturan"
-            st.rerun()
-
-    # ------------------------------------------------------------------
-    # Mini dashboard (3 kartu) -- sengaja hanya operasi vektor pandas
-    # (str.startswith, perbandingan ==) yang cepat walau datanya ~15rb
-    # baris, BUKAN .apply() per-baris yang dulu bikin Dashboard lemot.
-    # ------------------------------------------------------------------
-    total_hari_ini, total_diterima = get_dashboard_ringkas()
-    persen_progress = (total_diterima / TARGET_TOTAL_BAPP * 100) if TARGET_TOTAL_BAPP else 0
-
-    cm1, cm2, cm3 = st.columns(3)
-    with cm1:
-        render_metric_card("Penerimaan BAPP Hari Ini", f"{total_hari_ini:,}".replace(",", "."), "📅")
-    with cm2:
-        render_metric_card("Penerimaan BAPP Total", f"{total_diterima:,}".replace(",", "."), "📦")
-    with cm3:
-        render_metric_card(
-            "Progress Diterima",
-            f"{persen_progress:.1f}%",
-            "📊",
-        )
-    st.caption(f"Progress dihitung dari total diterima dibagi target {TARGET_TOTAL_BAPP:,} BAPP.".replace(",", "."))
-    st.markdown("")
-
-    df_riwayat = get_riwayat()
-
-    f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
-    with f1:
-        cari = st.text_input("Cari", label_visibility="collapsed", placeholder="🔎 Cari pengirim / Nomor Penerimaan")
-    with f2:
-        opsi_dir = ["Semua Direktorat"]
-        if not df_riwayat.empty:
-            opsi_dir += sorted(df_riwayat["Direktorat"].dropna().unique().tolist())
-        filter_direktorat = st.selectbox("Direktorat", opsi_dir, label_visibility="collapsed")
-    with f3:
-        filter_tanggal = st.date_input("Tanggal", value=None, label_visibility="collapsed")
-    with f4:
-        filter_status = st.selectbox("Status", ["Semua Status", "🟡 OPEN", "🟢 DITERIMA"], label_visibility="collapsed")
-
-    hasil = df_riwayat.copy()
-    if cari:
-        cari_lower = cari.strip().lower()
-        if cari_lower:
-            kolom_cari = [c for c in ("Nomor Penerimaan", "Pengirim", "Direktorat", "PIC") if c in hasil.columns]
-            if kolom_cari:
-                mask_cari = pd.Series(False, index=hasil.index)
-                for kolom in kolom_cari:
-                    mask_cari |= hasil[kolom].astype("string").str.lower().str.contains(cari_lower, regex=False, na=False)
-                hasil = hasil[mask_cari]
-    if filter_direktorat != "Semua Direktorat":
-        hasil = hasil[hasil["Direktorat"] == filter_direktorat]
-    if filter_tanggal:
-        hasil = hasil[hasil["Tanggal"] == filter_tanggal.strftime("%d/%m/%Y")]
-    if filter_status == "🟡 OPEN":
-        hasil = hasil[hasil["Status"] == STATUS_OPEN]
-    elif filter_status == "🟢 DITERIMA":
-        hasil = hasil[hasil["Status"] == STATUS_DITERIMA]
-
-    st.markdown("---")
-
-    if hasil.empty:
-        st.info("Belum ada penerimaan yang cocok.")
-    else:
-        total_hal = max(1, -(-len(hasil) // UKURAN_HALAMAN_DAFTAR))
-        halaman_ke = min(st.session_state.daftar_halaman_ke, total_hal)
-        awal = (halaman_ke - 1) * UKURAN_HALAMAN_DAFTAR
-        potongan = hasil.iloc[awal:awal + UKURAN_HALAMAN_DAFTAR]
-
-        lebar = [0.4, 1.1, 0.9, 1.1, 0.8, 0.6, 0.8, 1.1, 0.4, 0.4, 0.4]
-        judul_kolom = ["No", "Nomor Penerimaan", "Tanggal", "Pengirim", "Direktorat",
-                        "Jumlah", "PIC", "Status", "", "", ""]
-        for kolom, teks in zip(st.columns(lebar), judul_kolom):
-            kolom.markdown(f"**{teks}**")
-
-        for i, (_, baris) in enumerate(potongan.iterrows(), start=awal + 1):
-            c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = st.columns(lebar)
-            c1.write(i)
-            c2.write(baris["Nomor Penerimaan"])
-            c3.write(baris.get("Tanggal", "-"))
-            c4.write(baris.get("Pengirim") or "-")
-            c5.markdown(render_badge(baris.get("Direktorat", "-"), "biru"), unsafe_allow_html=True)
-            c6.write(int(baris["Jumlah BAPP"]))
-            c7.write(baris.get("PIC") or "-")
-
-            status = baris.get("Status", STATUS_DITERIMA)
-            sedang_open = status == STATUS_OPEN
-            if sedang_open:
-                c8.markdown(render_badge("🟡 OPEN", "kuning"), unsafe_allow_html=True)
-                if c9.button("✏️", key=f"edit_{baris['Nomor Penerimaan']}", help="Lanjutkan penerimaan"):
-                    berhasil, pesan_error = muat_penerimaan_open(baris["Nomor Penerimaan"])
-                    if berhasil:
-                        st.session_state.halaman = "form_baru"
-                        st.rerun()
-                    else:
-                        st.error(pesan_error)
-            else:
-                c8.markdown(render_badge("🟢 DITERIMA", "hijau"), unsafe_allow_html=True)
-                # Print langsung dari daftar tanpa panel/popup Streamlit.
-                nomor_daftar = baris["Nomor Penerimaan"]
-                tabel_daftar, info_daftar = get_detail_penerimaan(nomor_daftar)
-                if info_daftar:
-                    with c9:
-                        pdf_daftar, pdf_b64_daftar = get_pdf_cache(nomor_daftar, info_daftar, tabel_daftar)
-                        components.html(
-                            f"""
-                            <button id="btnPrintDaftar_{i}" title="Print BAPP" style="
-                                width:100%; height:38px; border:1px solid #d1d5db;
-                                border-radius:8px; background:#ffffff; color:#111827;
-                                font-size:18px; cursor:pointer;
-                            ">🖨️</button>
-                            <script>
-                            (function() {{
-                                const tombol = document.getElementById("btnPrintDaftar_{i}");
-                                const base64Data = "{pdf_b64_daftar}";
-
-                                tombol.addEventListener("click", function() {{
-                                    const byteChars = atob(base64Data);
-                                    const byteNumbers = new Array(byteChars.length);
-                                    for (let j = 0; j < byteChars.length; j++) {{
-                                        byteNumbers[j] = byteChars.charCodeAt(j);
-                                    }}
-                                    const blob = new Blob([new Uint8Array(byteNumbers)], {{ type: "application/pdf" }});
-                                    const blobUrl = URL.createObjectURL(blob);
-
-                                    // Buka tab baru dan langsung arahkan ke Blob URL.
-                                    // Tidak memakai data: URL yang kadang baru tampil setelah refresh.
-                                    const tab = window.open("about:blank", "_blank");
-                                    if (tab) {{
-                                        tab.location.href = blobUrl;
-                                        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-                                    }} else {{
-                                        // Fallback jika browser memblokir tab baru.
-                                        window.location.href = blobUrl;
-                                    }}
-                                }});
-                            }})();
-                            </script>
-                            """,
-                            height=45,
-                        )
-
-            if c10.button("👁", key=f"detail_{baris['Nomor Penerimaan']}", help="Lihat detail"):
-                st.session_state.halaman = "detail"
-                st.session_state.detail_nomor = baris["Nomor Penerimaan"]
-                st.rerun()
-
-            if sedang_open:
-                if c11.button("🗑", key=f"hapusdaftar_{baris['Nomor Penerimaan']}", help="Hapus penerimaan"):
-                    dialog_konfirmasi_hapus_penerimaan(baris["Nomor Penerimaan"])
-
-        st.markdown("---")
-        cp1, cp2, cp3 = st.columns([1, 2, 1])
-        with cp1:
-            if st.button("← Sebelumnya", disabled=halaman_ke <= 1):
-                st.session_state.daftar_halaman_ke = halaman_ke - 1
-                st.rerun()
-        with cp2:
-            st.markdown(
-                f"<div style='text-align:center;color:#6b7280;'>Halaman {halaman_ke} dari {total_hal}</div>",
-                unsafe_allow_html=True,
+            return Credentials.from_service_account_info(
+                service_account_info,
+                scopes=scopes,
             )
-        with cp3:
-            if st.button("Berikutnya →", disabled=halaman_ke >= total_hal):
-                st.session_state.daftar_halaman_ke = halaman_ke + 1
+    except Exception as e:
+        raise RuntimeError(
+            "Google credential dari Streamlit Secrets gagal dibaca. "
+            "Pastikan Secrets memiliki blok [gcp_service_account] "
+            "dan field service-account yang lengkap."
+        ) from e
+
+    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            f"File credential tidak ditemukan: {GOOGLE_SERVICE_ACCOUNT_FILE}. "
+            "Untuk Streamlit Cloud, gunakan Settings → Secrets "
+            "dengan blok [gcp_service_account]."
+        )
+
+    return Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=scopes,
+    )
+
+@st.cache_resource(show_spinner=False)
+def get_client():
+    if not DB_SHEET_ID:
+        raise RuntimeError(
+    "DB_SHEET_ID belum diisi. Isi di .env (lokal) atau Streamlit Secrets (Cloud)."
+    )
+    creds = _get_google_credentials(SHEETS_SCOPES)
+    return gspread.authorize(creds)
+@st.cache_resource(show_spinner=False)
+def get_spreadsheet():
+    return get_client().open_by_key(DB_SHEET_ID)
+    _WORKSHEET_CACHE = {}
+def get_or_create_worksheet(tab_name: str):
+    """Ambil worksheet; kalau belum ada, buat otomatis + isi baris header.
+    Objek worksheet disimpan di cache proses supaya tidak perlu tanya ulang
+    metadata sheet ke Google tiap kali dipanggil (ini salah satu penyebab
+    utama aplikasi terasa lambat, karena tiap interaksi di Streamlit
+    menjalankan ulang seluruh script dari atas).
+    """
+    if tab_name in _WORKSHEET_CACHE:
+        return _WORKSHEET_CACHE[tab_name]
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab_name, rows=2000, cols=len(TAB_HEADERS[tab_name]) + 2)
+    ws.append_row(TAB_HEADERS[tab_name], value_input_option="USER_ENTERED")
+    _WORKSHEET_CACHE[tab_name] = ws
+    return ws
+def read_rows_with_index(tab_name: str):
+    """List (nomor_baris, dict) untuk tiap baris data (baris header dilewati).
+    Dibaca manual (bukan get_all_records()) supaya tidak error kalau ada
+    kolom kosong/duplikat di baris header.
+    """
+    ws = get_or_create_worksheet(tab_name)
+    values = ws.get_all_values()
+    if not values:
+        return TAB_HEADERS[tab_name], []
+    header = values[0]
+    rows = []
+    for i, raw in enumerate(values[1:], start=2):
+        d = {header[j]: (raw[j] if j < len(raw) else "") for j in range(len(header))}
+    rows.append((i, d))
+    return header, rows
+def read_records(tab_name: str) -> list:
+    _, rows = read_rows_with_index(tab_name)
+    return [d for _, d in rows]
+def append_row(tab_name: str, row: list):
+    append_rows(tab_name, [row])
+def append_rows(tab_name: str, rows: list):
+    if not rows:
+        return
+    ws = get_or_create_worksheet(tab_name)
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+def batch_update_cells(tab_name: str, cell_updates: list):
+    """cell_updates: list berisi tuple (nomor_baris, nama_kolom, nilai_baru)."""
+    if not cell_updates:
+        return
+    ws = get_or_create_worksheet(tab_name)
+    header = ws.row_values(1)
+    data = []
+    for row_number, col_name, value in cell_updates:
+        col_idx = header.index(col_name) + 1
+    a1 = rowcol_to_a1(row_number, col_idx)
+    data.append({"range": a1, "values": [[value]]})
+    ws.batch_update(data, value_input_option="USER_ENTERED")
+
+# =============================================================================
+
+# 3. BACA MASTER BAPP LANGSUNG DARI SHEET ASLINYA + SINKRONISASI
+
+# =============================================================================
+
+@st.cache_data(ttl=120, show_spinner="Membaca Master BAPP dari Google Sheet...")
+def get_master_dataframe() -> pd.DataFrame:
+    ws = get_client().open_by_key(MASTER_SHEET_ID).worksheet(MASTER_SHEET_WORKSHEET_NAME)
+
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+
+    header_row = values[0]
+    col_index = {}
+    for i, name in enumerate(header_row):
+        name = name.strip()
+        if name and name not in col_index:  # abaikan kolom kosong & duplikat
+            col_index[name] = i
+
+    mapped = []
+    for raw_row in values[1:]:
+        row = {}
+        for key, sheet_header in COLUMN_MAP.items():
+            idx = col_index.get(sheet_header)
+            row[key] = raw_row[idx].strip() if idx is not None and idx < len(raw_row) else ""
+        if row.get("nomor_bundle"):
+            mapped.append(row)
+
+    return pd.DataFrame(mapped)
+
+def sync_master_bapp(progress_callback=None) -> dict:
+    """Sinkronkan Master BAPP -> tab master_bundle. Bundle lama tidak pernah
+    tertimpa lokasi/waktunya; hanya bundle baru yang ditempatkan di Tim Gate.
+    """
+    get_master_dataframe.clear()
+    df = get_master_dataframe()
+
+    if df.empty:
+        return {"total_baris_sheet": 0, "total_bundle_di_sheet": 0, "bundle_baru": 0}
+
+    if progress_callback:
+        progress_callback(1, 3, f"Membaca {len(df)} baris dari Master BAPP...")
+
+    _, existing_rows = read_rows_with_index(TAB_MASTER_BUNDLE)
+    existing_by_nomor = {d.get("nomor_bundle"): row_no for row_no, d in existing_rows}
+
+    grouped = df.groupby("nomor_bundle")
+    new_bundle_rows, new_riwayat_rows, update_cells = [], [], []
+    bundle_baru = 0
+
+    if progress_callback:
+        progress_callback(2, 3, f"Memproses {grouped.ngroups} bundle...")
+
+    for nomor_bundle, g in grouped:
+        jumlah = len(g)
+        direktorat = g["direktorat"].iloc[0]
+
+        if nomor_bundle in existing_by_nomor:
+            row_no = existing_by_nomor[nomor_bundle]
+            update_cells.append((row_no, "jumlah_bapp", jumlah))
+            update_cells.append((row_no, "direktorat", direktorat))
+            continue
+
+        status_kedua_set = set(g["status_bapp_fisik_kedua"])
+        if not (status_kedua_set & STATUS_AWAL_TIM_GATE):
+            continue  # belum lolos penerimaan kedua, ditunda ke sync berikutnya
+
+        waktu_awal = datetime.now().strftime(DT_FORMAT)
+        new_bundle_rows.append([nomor_bundle, direktorat, jumlah, LOKASI_AWAL, waktu_awal, "Active"])
+        new_riwayat_rows.append([nomor_bundle, "", LOKASI_AWAL, waktu_awal, ""])
+        bundle_baru += 1
+
+    if update_cells:
+        batch_update_cells(TAB_MASTER_BUNDLE, update_cells)
+    if new_bundle_rows:
+        append_rows(TAB_MASTER_BUNDLE, new_bundle_rows)
+    if new_riwayat_rows:
+        append_rows(TAB_RIWAYAT, new_riwayat_rows)
+
+    if progress_callback:
+        progress_callback(3, 3, "Selesai")
+
+    _read_master_bundle_cached.clear()
+
+    return {
+        "total_baris_sheet": len(df),
+        "total_bundle_di_sheet": grouped.ngroups,
+        "bundle_baru": bundle_baru,
+    }
+
+# =============================================================================
+
+# 4. BUNDLE: LOOKUP BERDASARKAN LOKASI + DIREKTORAT + DIGIT TERAKHIR
+
+# =============================================================================
+
+def _row_to_bundle(d: dict) -> dict:
+    return {
+    "nomor_bundle": d.get("nomor_bundle", ""),
+    "direktorat": d.get("direktorat", ""),
+    "jumlah_bapp": int(d.get("jumlah_bapp") or 0),
+    "lokasi_saat_ini": d.get("lokasi_saat_ini", ""),
+    "status": d.get("status", "Active"),
+    }
+@st.cache_data(ttl=120, show_spinner=False)
+def _read_master_bundle_cached():
+    """Dicache 120 detik supaya dropdown Direktorat & pencarian digit tidak
+    menarik ulang seluruh tab master_bundle dari Google Sheets di SETIAP
+    interaksi (tiap klik/ketik di Streamlit menjalankan ulang seluruh
+    script). Cache ini dibersihkan otomatis setiap habis Sinkronisasi Data
+    atau setelah transaksi perpindahan berhasil, jadi datanya tetap segar
+    persis saat dibutuhkan.
+    """
+    return read_records(TAB_MASTER_BUNDLE)
+def get_bundles_by_lokasi(lokasi: str):
+    records = _read_master_bundle_cached()
+    return [
+    _row_to_bundle(r) for r in records
+    if r.get("lokasi_saat_ini") == lokasi and (r.get("status") or "Active") == "Active"
+    ]
+def get_direktorat_options(dari_lokasi: str):
+    bundles = get_bundles_by_lokasi(dari_lokasi)
+    return sorted({b["direktorat"] for b in bundles if b["direktorat"]})
+def cari_bundle_by_digit(dari_lokasi: str, direktorat_filter: str, digits: str, exclude_nomor: set):
+    """Cari bundle di lokasi tertentu (+ opsional direktorat) yang nomornya
+    berakhiran `digits`, tidak termasuk yang sudah dipilih (`exclude_nomor`).
+    """
+    digits = digits.strip()
+    if not digits:
+        return []
+    bundles = get_bundles_by_lokasi(dari_lokasi)
+    hasil = []
+    for b in bundles:
+        if b["nomor_bundle"] in exclude_nomor:
+            continue
+        if direktorat_filter != "Semua Direktorat" and b["direktorat"] != direktorat_filter:
+            continue
+        if b["nomor_bundle"].endswith(digits):
+            hasil.append(b)
+    return hasil
+
+# =============================================================================
+
+# 5. TRANSAKSI PERPINDAHAN
+
+# =============================================================================
+
+def generate_id_transaksi(tanggal: date) -> str:
+    prefix = f"TRF-{tanggal.strftime('%Y%m%d')}-"
+    ids = [r.get("id_transaksi", "") for r in read_records(TAB_TRANSAKSI)]
+    nums = [int(i.split("-")[-1]) for i in ids if i.startswith(prefix)]
+    urut = max(nums) + 1 if nums else 1
+    return f"{prefix}{urut:04d}"
+def create_transaksi_perpindahan(dari_lokasi, ke_lokasi, nama_pengirim, nama_penerima,
+    nomor_bundle_list, drive_folder_id=None, drive_folder_url=None,
+    id_transaksi_override=None):
+    """Catat satu transaksi perpindahan untuk banyak bundle (bisa lintas
+    direktorat) sekaligus. Selalu membaca ulang lokasi PALING BARU tepat
+    sebelum menulis, supaya tidak menimpa perpindahan yang baru saja
+    dilakukan orang lain (brief: pencegahan double-submit).
+    """
+    if ke_lokasi != ALUR_LOKASI.get(dari_lokasi):
+        raise ValueError(f"Perpindahan {dari_lokasi} -> {ke_lokasi} tidak diperbolehkan.")
+
+    now = datetime.now()
+    _, indexed_rows = read_rows_with_index(TAB_MASTER_BUNDLE)
+    by_nomor = {d.get("nomor_bundle"): (row_no, d) for row_no, d in indexed_rows}
+
+    invalid, valid = [], []
+    for nb in nomor_bundle_list:
+        entry = by_nomor.get(nb)
+        if entry is None or entry[1].get("lokasi_saat_ini") != dari_lokasi:
+            invalid.append(nb)
+        else:
+            direktorat = entry[1].get("direktorat", "")
+            jumlah = int(entry[1].get("jumlah_bapp") or 0)
+            valid.append((nb, entry[0], direktorat, jumlah))
+
+    if invalid:
+        raise ValueError(
+            "Perpindahan dibatalkan, bundle berikut sudah tidak berada di "
+            f"{dari_lokasi} (mungkin baru saja dipindahkan orang lain): {', '.join(invalid)}. "
+            "Kembali ke Form untuk memeriksa ulang daftar bundle."
+        )
+    if not valid:
+        raise ValueError("Tidak ada bundle valid untuk dipindahkan.")
+
+    id_transaksi = id_transaksi_override or generate_id_transaksi(now.date())
+
+    # Cegah ID transaksi yang sama tercatat dua kali. Ini terutama berguna
+    # karena pada alur baru PDF di-upload lebih dulu, lalu transaksi baru
+    # benar-benar di-commit ke database.
+    if any(r.get("id_transaksi") == id_transaksi for r in read_records(TAB_TRANSAKSI)):
+        raise ValueError(f"ID transaksi {id_transaksi} sudah digunakan. Silakan submit ulang.")
+
+    total_bapp = sum(v[3] for v in valid)
+
+    append_row(TAB_TRANSAKSI, [
+        id_transaksi, now.strftime("%d/%m/%Y"), now.strftime("%H:%M"),
+        nama_pengirim, nama_penerima, dari_lokasi, ke_lokasi,
+        len(valid), total_bapp, "Completed",
+        drive_folder_id or "", drive_folder_url or "", now.strftime(DT_FORMAT),
+    ])
+    append_rows(TAB_DETAIL, [[id_transaksi, nb, direktorat, jumlah] for nb, _, direktorat, jumlah in valid])
+    append_rows(TAB_RIWAYAT, [[nb, dari_lokasi, ke_lokasi, now.strftime(DT_FORMAT), id_transaksi] for nb, _, _, _ in valid])
+
+    cell_updates = []
+    for nb, row_no, _, _ in valid:
+        cell_updates.append((row_no, "lokasi_saat_ini", ke_lokasi))
+        cell_updates.append((row_no, "waktu", now.strftime(DT_FORMAT)))
+    batch_update_cells(TAB_MASTER_BUNDLE, cell_updates)
+    _read_master_bundle_cached.clear()
+
+    return id_transaksi, len(valid), total_bapp
+
+def update_transaksi_drive_info(id_transaksi, drive_folder_id, drive_folder_url):
+    _, rows = read_rows_with_index(TAB_TRANSAKSI)
+    for row_no, d in rows:
+        if d.get("id_transaksi") == id_transaksi:
+            batch_update_cells(TAB_TRANSAKSI, [
+    (row_no, "drive_folder_id", drive_folder_id),
+    (row_no, "drive_folder_url", drive_folder_url),
+    ])
+    return True
+    return False
+
+# =============================================================================
+
+# 6. UPLOAD BUKTI KE GOOGLE DRIVE (opsional)
+
+# =============================================================================
+
+def drive_is_enabled() -> bool:
+    return bool(DRIVE_ROOT_FOLDER_ID)
+def _get_drive_service():
+    """Buat client Drive.
+
+    Prioritas: OAuth akun Google manusia (untuk My Drive), lalu service
+    account (cocok untuk Shared Drive). Service account tidak memiliki
+    storage quota untuk memiliki file sendiri.
+    """
+    drive_scope = ["https://www.googleapis.com/auth/drive"]
+
+    try:
+        oauth_cfg = st.secrets.get("google_drive_oauth", None)
+        if oauth_cfg:
+            cfg = dict(oauth_cfg)
+            client_id = str(cfg.get("client_id", "")).strip()
+            client_secret = str(cfg.get("client_secret", "")).strip()
+            refresh_token = str(cfg.get("refresh_token", "")).strip()
+            if client_id and client_secret and refresh_token:
+                creds = UserCredentials(
+                    token=None,
+                    refresh_token=refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    scopes=drive_scope,
+                )
+                creds.refresh(Request())
+                return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        raise RuntimeError(
+            "Google Drive OAuth gagal. Periksa bagian [google_drive_oauth] "
+            "di Streamlit Secrets (client_id, client_secret, refresh_token)."
+        ) from e
+
+    creds = _get_google_credentials(drive_scope)
+    return build("drive", "v3", credentials=creds)
+
+def _find_or_create_drive_folder(service, name: str, parent_id: str) -> str:
+    query = (
+    f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' "
+    f"and '{parent_id}' in parents and trashed = false"
+    )
+    res = service.files().list(
+    q=query,
+    fields="files(id, name, driveId)",
+    supportsAllDrives=True,
+    includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+    metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+    folder = service.files().create(
+    body=metadata, fields="id", supportsAllDrives=True
+    ).execute()
+    return folder["id"]
+def _grant_admin_drive_access(service, folder_id: str):
+    """Berikan akses baca ke folder transaksi untuk email admin.
+
+    Ini membuat admin tetap bisa membuka PDF walaupun admin bukan orang yang
+    mengisi form. ADMIN_EMAIL sebaiknya diisi dengan akun Google admin.
+    Kalau ADMIN_EMAIL kosong, tidak ada permission tambahan yang dibuat.
+    """
+    if not ADMIN_EMAIL:
+        return
+
+    # Cek permission yang sudah ada agar tidak membuat duplikat.
+    try:
+        existing = service.permissions().list(
+            fileId=folder_id,
+            fields="permissions(id,emailAddress,type,role)",
+            supportsAllDrives=True,
+        ).execute().get("permissions", [])
+        if any(
+            p.get("type") == "user"
+            and p.get("emailAddress", "").lower() == ADMIN_EMAIL.lower()
+            for p in existing
+        ):
+            return
+    except Exception:
+        # Kalau pengecekan permission gagal, tetap coba membuat permission.
+        pass
+
+    service.permissions().create(
+        fileId=folder_id,
+        body={"type": "user", "role": "reader", "emailAddress": ADMIN_EMAIL},
+        sendNotificationEmail=False,
+        supportsAllDrives=True,
+    ).execute()
+
+def _check_drive_root(service):
+    """Validasi root folder dan beri pesan jelas bila service account diarahkan ke My Drive."""
+    try:
+        info = service.files().get(
+    fileId=DRIVE_ROOT_FOLDER_ID,
+    fields="id,name,mimeType,driveId,capabilities(canAddChildren)",
+    supportsAllDrives=True,
+    ).execute()
+    except Exception as e:
+        raise RuntimeError(
+    "DRIVE_ROOT_FOLDER_ID tidak bisa diakses oleh akun Google yang dipakai aplikasi. "
+    "Pastikan folder dibagikan ke akun tersebut dan ID folder benar. Detail: " + str(e)
+    ) from e
+
+    if info.get("mimeType") != "application/vnd.google-apps.folder":
+        raise RuntimeError("DRIVE_ROOT_FOLDER_ID bukan ID folder Google Drive.")
+
+    return info
+
+def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
+    """Upload semua file bukti ke PERPINDAHAN DOKUMEN/<tahun>/<bulan>/<id_transaksi>/."""
+    if not drive_is_enabled():
+        raise RuntimeError("DRIVE_ROOT_FOLDER_ID belum diisi. Isi di .env (lokal) atau Streamlit Secrets (Cloud).")
+
+    service = _get_drive_service()
+    _check_drive_root(service)
+    tahun_id = _find_or_create_drive_folder(service, str(tanggal.year), DRIVE_ROOT_FOLDER_ID)
+    bulan_id = _find_or_create_drive_folder(service, f"{tanggal.month:02d}", tahun_id)
+    transaksi_folder_id = _find_or_create_drive_folder(service, id_transaksi, bulan_id)
+    _grant_admin_drive_access(service, transaksi_folder_id)
+
+    for path in local_file_paths:
+        media = MediaFileUpload(path, resumable=True)
+        service.files().create(
+            body={"name": os.path.basename(path), "parents": [transaksi_folder_id]},
+            media_body=media, fields="id", supportsAllDrives=True,
+        ).execute()
+
+    folder_url = f"https://drive.google.com/drive/folders/{transaksi_folder_id}"
+    return transaksi_folder_id, folder_url
+
+# =============================================================================
+
+# 7. TANDA TANGAN DIGITAL & PDF RINGKASAN
+
+# =============================================================================
+
+def _ambil_image_data_canvas(canvas_obj):
+    """
+    Ambil image_data dari st_canvas dengan aman.
+
+    streamlit-drawable-canvas dapat melempar RuntimeError ketika canvas belum
+    mempunyai image_data_url (misalnya pada render awal di Streamlit Cloud).
+    Kondisi tersebut berarti belum ada tanda tangan, bukan berarti aplikasi
+    harus crash.
+    """
+    if canvas_obj is None:
+        return None
+
+    try:
+        image_data = canvas_obj.image_data
+    except (RuntimeError, AttributeError, KeyError, TypeError):
+        return None
+    except Exception:
+        # Jangan biarkan error internal widget merusak seluruh halaman.
+        return None
+
+    if image_data is None:
+        return None
+
+    try:
+        arr = np.asarray(image_data)
+    except Exception:
+        return None
+
+    if arr.size == 0 or arr.ndim < 2:
+        return None
+
+    return arr
+
+def _ada_goresan_ttd(image_data) -> bool:
+    """Cek apakah kanvas tanda tangan sudah digambar (bukan cuma kanvas putih
+    kosong). image_data adalah array RGBA dari st_canvas."""
+    if image_data is None:
+        return False
+
+    try:
+        arr = np.asarray(image_data)
+        if arr.size == 0 or arr.ndim < 2:
+            return False
+
+        rgb = arr[:, :, :3]
+        return bool(np.any(rgb != 255))
+    except Exception:
+        return False
+
+def _simpan_ttd_png(image_data, path: str):
+    if image_data is None:
+        raise ValueError("Data tanda tangan kosong.")
+
+    arr = np.asarray(image_data)
+    if arr.size == 0 or arr.ndim < 2:
+        raise ValueError("Data tanda tangan tidak valid.")
+
+    # Pastikan RGBA. Beberapa versi widget bisa menghasilkan RGB.
+    if arr.shape[2] == 3:
+        alpha = np.full(arr.shape[:2] + (1,), 255, dtype=arr.dtype)
+        arr = np.concatenate([arr, alpha], axis=2)
+
+    img = Image.fromarray(arr.astype("uint8"), "RGBA")
+    # Tempel di atas latar putih supaya tidak transparan saat dimasukkan ke PDF.
+    background = Image.new("RGB", img.size, (255, 255, 255))
+    background.paste(img, mask=img.split()[3])
+    background.save(path)
+
+def _teks_pdf(t) -> str:
+    """Font bawaan PDF cuma dukung Latin-1; ganti karakter yang tidak
+    didukung supaya tidak error saat ada nama dengan simbol aneh."""
+    return str(t).encode("latin-1", "replace").decode("latin-1")
+def generate_pdf_ringkasan(data: dict, sig_pengirim_path: str, sig_penerima_path: str) -> bytes:
+    """Bikin PDF ringkasan perpindahan + tanda tangan pengirim & penerima."""
+    buffer = io.BytesIO()
+    c = pdfcanvas.Canvas(buffer, pagesize=A4)
+    _, tinggi_hal = A4
+    y = tinggi_hal - 25 * mm
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(20 * mm, y, _teks_pdf("Bukti Perpindahan Dokumen BAPP"))
+    y -= 12 * mm
+
+    c.setFont("Helvetica", 11)
+    baris = [
+        f"ID Transaksi   : {data['id_transaksi']}",
+        f"Tanggal/Waktu  : {data['waktu'].strftime('%d %B %Y, %H:%M')}",
+        f"Pengirim       : {data['nama_pengirim']}",
+        f"Penerima       : {data['nama_penerima']}",
+        f"Dari -> Ke     : {data['dari_lokasi']} -> {data['ke_lokasi']}",
+    ]
+    for b in baris:
+        c.drawString(20 * mm, y, _teks_pdf(b))
+        y -= 7 * mm
+
+    y -= 3 * mm
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(20 * mm, y, _teks_pdf("Rincian per Direktorat"))
+    y -= 8 * mm
+
+    c.setFont("Helvetica", 11)
+    for direktorat, agg in sorted(data["by_direktorat"].items()):
+        c.drawString(20 * mm, y, _teks_pdf(f"- {direktorat}: {agg['jumlah_bundle']} Bundle / {agg['total_bapp']} BAPP"))
+        y -= 7 * mm
+
+    # Detail setiap bundle yang ikut dalam transaksi.
+    y -= 3 * mm
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(20 * mm, y, _teks_pdf("Detail Bundle"))
+    y -= 8 * mm
+
+    # Header tabel.
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(20 * mm, y, _teks_pdf("No"))
+    c.drawString(30 * mm, y, _teks_pdf("Nomor Bundle"))
+    c.drawString(92 * mm, y, _teks_pdf("Direktorat"))
+    c.drawRightString(178 * mm, y, _teks_pdf("Jumlah BAPP"))
+    y -= 6 * mm
+
+    c.setFont("Helvetica", 9)
+    detail_bundle = data.get("detail_bundle", [])
+    for no, bundle in enumerate(detail_bundle, start=1):
+        # Kalau tabel panjang, lanjut ke halaman berikutnya.
+        if y < 35 * mm:
+            c.showPage()
+            y = tinggi_hal - 25 * mm
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(20 * mm, y, _teks_pdf("Detail Bundle (lanjutan)"))
+            y -= 8 * mm
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(20 * mm, y, _teks_pdf("No"))
+            c.drawString(30 * mm, y, _teks_pdf("Nomor Bundle"))
+            c.drawString(92 * mm, y, _teks_pdf("Direktorat"))
+            c.drawRightString(178 * mm, y, _teks_pdf("Jumlah BAPP"))
+            y -= 6 * mm
+            c.setFont("Helvetica", 9)
+
+        c.drawString(20 * mm, y, _teks_pdf(str(no)))
+        c.drawString(30 * mm, y, _teks_pdf(str(bundle.get("nomor_bundle", ""))))
+        c.drawString(92 * mm, y, _teks_pdf(str(bundle.get("direktorat", ""))))
+        c.drawRightString(178 * mm, y, _teks_pdf(str(bundle.get("jumlah_bapp", 0))))
+        y -= 6 * mm
+
+    # Pastikan TOTAL dan tanda tangan tidak bertabrakan dengan tabel.
+    if y < 75 * mm:
+        c.showPage()
+        y = tinggi_hal - 25 * mm
+
+    y -= 3 * mm
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(20 * mm, y, _teks_pdf(f"TOTAL: {data['total_bundle']} Bundle / {data['total_bapp']} BAPP"))
+    y -= 25 * mm
+
+    lebar_ttd, tinggi_ttd = 70 * mm, 30 * mm
+    x_pengirim, x_penerima = 20 * mm, 120 * mm
+    y_gambar = y - tinggi_ttd
+
+    c.drawImage(sig_pengirim_path, x_pengirim, y_gambar, width=lebar_ttd, height=tinggi_ttd,
+                preserveAspectRatio=True, anchor="sw", mask="auto")
+    c.drawImage(sig_penerima_path, x_penerima, y_gambar, width=lebar_ttd, height=tinggi_ttd,
+                preserveAspectRatio=True, anchor="sw", mask="auto")
+
+    y_label = y_gambar - 6 * mm
+    c.setFont("Helvetica", 10)
+    c.drawCentredString(x_pengirim + lebar_ttd / 2, y_label, _teks_pdf(f"( {data['nama_pengirim']} )"))
+    c.drawCentredString(x_penerima + lebar_ttd / 2, y_label, _teks_pdf(f"( {data['nama_penerima']} )"))
+    y_label -= 6 * mm
+    c.drawCentredString(x_pengirim + lebar_ttd / 2, y_label, "Pengirim")
+    c.drawCentredString(x_penerima + lebar_ttd / 2, y_label, "Penerima")
+
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
+
+# =============================================================================
+
+# 8. ADMIN: RIWAYAT TRANSAKSI + AKSES PDF
+
+# =============================================================================
+
+def _get_admin_password():
+    return ADMIN_PASSWORD
+def _get_admin_email():
+    return ADMIN_EMAIL
+def _admin_authenticated() -> bool:
+    return bool(st.session_state.get("admin_authenticated", False))
+def render_admin_page():
+    st.subheader("🔐 Admin — Riwayat Perpindahan")
+    st.caption(
+    "Admin dapat melihat seluruh transaksi yang tersimpan di spreadsheet "
+    "dan membuka PDF bukti, meskipun admin bukan pengisi form."
+    )
+
+    # Baca ulang saat halaman admin dibuka. Ini membuat perubahan Secrets
+    # terbaca setelah reboot/redeploy tanpa bergantung pada nilai lama
+    # yang tersimpan saat modul pertama kali dimuat.
+    expected_password = _setting("ADMIN_PASSWORD")
+    admin_email = _setting("ADMIN_EMAIL")
+
+    if not expected_password:
+        st.error(
+            "Akses admin belum dikonfigurasi. ADMIN_PASSWORD tidak terbaca "
+            "dari Streamlit Secrets/.env."
+        )
+        st.info(
+            "Format yang disarankan: ADMIN_PASSWORD = \"password-kamu\" "
+            "di level utama Secrets (sebelum [gcp_service_account]). "
+            "Setelah mengubah Secrets, klik Reboot app di Streamlit Cloud."
+        )
+        try:
+            top_keys = sorted(
+                str(k) for k in st.secrets.keys()
+                if str(k).lower() not in {
+                    "private_key", "client_secret", "refresh_token",
+                    "password", "token", "secret"
+                }
+            )
+            if top_keys:
+                st.caption("Secrets yang terbaca di level utama: " + ", ".join(top_keys))
+        except Exception:
+            pass
+        return
+
+    if not _admin_authenticated():
+        with st.form("form_login_admin"):
+            password = st.text_input("Password Admin", type="password")
+            masuk = st.form_submit_button("🔓 Masuk Admin", type="primary", use_container_width=True)
+        if masuk:
+            if password == expected_password:
+                st.session_state.admin_authenticated = True
                 st.rerun()
+            else:
+                st.error("Password admin salah.")
+        return
 
-
-# =====================================================================
-# 11. HALAMAN: SCAN BAPP (setelah popup Buat Penerimaan Baru)
-# =====================================================================
-
-elif st.session_state.halaman == "form_baru":
-    info = st.session_state.get("penerimaan_aktif")
-
-    if not info:
-        st.warning("Belum ada penerimaan aktif. Klik tombol di bawah untuk memulai.")
-        if st.button("+ Buat Penerimaan Baru", type="primary"):
-            buka_dialog_penerimaan_baru()
-    else:
-        if st.button("← Kembali ke Daftar Penerimaan"):
-            st.session_state.halaman = "daftar"
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        st.success(f"Login admin aktif{(' — ' + admin_email) if admin_email else ''}")
+    with col2:
+        if st.button("Keluar", use_container_width=True):
+            st.session_state.admin_authenticated = False
             st.rerun()
 
-        c_judul, c_status = st.columns([4, 1])
-        with c_judul:
-            st.markdown(f"### PENERIMAAN BAPP — {info['nomor_penerimaan']}")
-        with c_status:
-            st.markdown(render_badge("🟡 OPEN / Belum Diterima", "kuning"), unsafe_allow_html=True)
+    _, rows = read_rows_with_index(TAB_TRANSAKSI)
+    if not rows:
+        st.info("Belum ada transaksi perpindahan.")
+        return
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.markdown(f"**Pengirim**  \n{info['nama_pengirim']}")
-        c2.markdown(f"**Direktorat**  \n{info['direktorat']}")
-        c3.markdown(f"**Tanggal**  \n{format_tanggal_indonesia(info['tanggal'])}")
-        c4.markdown(f"**PIC**  \n{info['pic']}")
-        c5.markdown(f"**Jumlah BAPP**  \n{len(st.session_state.scan_list)}")
+    # Tampilkan transaksi terbaru di atas.
+    rows = list(reversed(rows))
+    pilihan = []
+    for _, d in rows:
+        tid = d.get("id_transaksi", "")
+        if tid:
+            pilihan.append(tid)
 
-        st.markdown("---")
-        st.text_input(
-            "🔍 Scan Barcode / Ketik Nomor Transaksi",
-            key="input_scan",
-            placeholder="Scan barcode, ketik Nomor Transaksi lengkap, atau cukup 1-5 digit terakhirnya...",
-            on_change=handle_scan_input,
-        )
-        autofocus_scan_input()
+    selected_id = st.selectbox("Pilih ID Transaksi", pilihan)
+    selected = next((d for _, d in rows if d.get("id_transaksi") == selected_id), None)
+    if not selected:
+        return
 
-        if st.session_state.scan_message:
-            tipe, pesan = st.session_state.scan_message
-            getattr(st, tipe)(pesan)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bundle", selected.get("jumlah_bundle", "0"))
+    c2.metric("BAPP", selected.get("total_bapp", "0"))
+    c3.metric("Status", selected.get("status", ""))
 
-        st.markdown("#### Daftar BAPP")
-        st.caption("Setiap BAPP yang berhasil di-scan langsung tersimpan (status OPEN) -- aman dilanjutkan nanti.")
-        if st.session_state.scan_list:
-            lebar = [0.5, 1.4, 1, 1.7, 1.4, 0.9, 1.1, 1.4, 0.5]
-            judul = ["No", "Nomor Transaksi", "NPSN", "Nama Sekolah", "Nomor Penerimaan Pertama",
-                     "Nomor Urut", "Serial Number", "Nama Koordinator", ""]
-            for kolom, teks in zip(st.columns(lebar), judul):
-                kolom.markdown(f"**{teks}**")
+    st.write(f"**Tanggal:** {selected.get('tanggal', '')} {selected.get('waktu', '')}")
+    st.write(f"**Pengirim:** {selected.get('nama_pengirim', '')}")
+    st.write(f"**Penerima:** {selected.get('nama_penerima', '')}")
+    st.write(f"**Perpindahan:** {selected.get('dari_lokasi', '')} → {selected.get('ke_lokasi', '')}")
 
-            for i, item in enumerate(st.session_state.scan_list):
-                c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(lebar)
-                c1.write(i + 1)
-                c2.write(item["nomor_transaksi"])
-                c3.write(item["npsn"])
-                c4.write(item["nama_sekolah"])
-                c5.write(ekstrak_nomor_penerimaan_pertama(item.get("nomor_penerimaan_pertama", "")) or "-")
-                c6.write(item.get("nomor_urut_pertama", "") or "-")
-                c7.write(item["serial_number"])
-                c8.write(item["nama_koordinator"])
-                if c9.button("🗑", key=f"hapus_scan_{i}"):
-                    dialog_konfirmasi_hapus_bapp(i)
-        else:
-            st.info("Belum ada BAPP yang di-scan.")
-
-        st.markdown("---")
-        col_tutup, col_batal = st.columns([2, 1])
-        with col_tutup:
-            if st.button("🔒 CLOSE FOLDER / SIMPAN PENERIMAAN", type="primary", use_container_width=True,
-                         disabled=len(st.session_state.scan_list) == 0):
-                dialog_konfirmasi_tutup_penerimaan(info["nomor_penerimaan"])
-        with col_batal:
-            if st.button("❌ Batalkan Penerimaan", use_container_width=True):
-                dialog_konfirmasi_batalkan_penerimaan()
-        if not st.session_state.scan_list:
-            st.caption("Scan minimal 1 BAPP sebelum bisa menutup penerimaan.")
-
-
-# =====================================================================
-# 12. HALAMAN: DETAIL PENERIMAAN
-# =====================================================================
-
-elif st.session_state.halaman == "detail":
-    if st.button("← Kembali"):
-        st.session_state.halaman = "daftar"
-        st.rerun()
-
-    nomor = st.session_state.get("detail_nomor")
-    tabel, info = get_detail_penerimaan(nomor) if nomor else (pd.DataFrame(), {})
-
-    if not info:
-        st.warning("Data penerimaan tidak ditemukan. Coba refresh data master di menu Pengaturan.")
+    drive_url = selected.get("drive_folder_url", "").strip()
+    if drive_url:
+        st.link_button("📄 Buka PDF / Folder Bukti di Google Drive", drive_url, use_container_width=True)
+        st.caption("Jika akun admin belum memiliki izin Drive, pastikan ADMIN_EMAIL berisi email Google admin dan transaksi dibuat ulang setelah konfigurasi tersebut aktif.")
     else:
-        c_judul, c_status = st.columns([4, 1])
-        with c_judul:
-            st.title("DETAIL PENERIMAAN")
-        with c_status:
-            st.write("")
-            if info["status"] == STATUS_OPEN:
-                st.markdown(render_badge("🟡 OPEN / Belum Diterima", "kuning"), unsafe_allow_html=True)
+        st.warning(
+            "PDF untuk transaksi ini belum memiliki link Google Drive. "
+            "Pastikan DRIVE_ROOT_FOLDER_ID sudah diisi agar bukti PDF tersimpan permanen dan dapat diakses admin."
+        )
+
+    st.divider()
+    st.write("**Daftar transaksi**")
+    table_rows = []
+    for _, d in rows:
+        table_rows.append({
+            "ID Transaksi": d.get("id_transaksi", ""),
+            "Tanggal": d.get("tanggal", ""),
+            "Pengirim": d.get("nama_pengirim", ""),
+            "Penerima": d.get("nama_penerima", ""),
+            "Dari": d.get("dari_lokasi", ""),
+            "Ke": d.get("ke_lokasi", ""),
+            "Bundle": d.get("jumlah_bundle", ""),
+            "BAPP": d.get("total_bapp", ""),
+            "Status": d.get("status", ""),
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+# =============================================================================
+
+# 8. STATE WIZARD
+
+# =============================================================================
+
+def init_wizard_state():
+    defaults = {
+    "wizard_step": "form",
+    "selected_bundles": [],
+    "data_dari_lokasi": "Tim Gate",
+    "_dari_terakhir": "Tim Gate",
+    "data_nama_pengirim": "",
+    "data_nama_penerima": "",
+    "last_result": None,
+    "submit_error": None,
+    "canvas_version": 0,
+    "ttd_pengirim_image": None,
+    "ttd_penerima_image": None,
+    "admin_authenticated": False,
+    "show_admin": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+def reset_wizard():
+    st.session_state.wizard_step = "form"
+    st.session_state.selected_bundles = []
+    st.session_state.last_result = None
+    st.session_state.submit_error = None
+    st.session_state.ttd_pengirim_image = None
+    st.session_state.ttd_penerima_image = None
+    # Ganti "versi" kanvas tanda tangan supaya widget-nya dibuat ulang dari
+    # kosong untuk transaksi berikutnya (bukan melanjutkan goresan lama).
+    st.session_state.canvas_version = st.session_state.get("canvas_version", 0) + 1
+    st.session_state.data_nama_pengirim = ""
+    st.session_state.data_nama_penerima = ""
+    for k in list(st.session_state.keys()):
+        if k in ("widget_nama_pengirim", "widget_nama_penerima", "digit_search", "hasil_cari_bundle") or str(k).startswith("bundle_picker_"):
+            st.session_state.pop(k, None)
+
+# =============================================================================
+
+# 9. HALAMAN / STEP WIZARD
+
+# =============================================================================
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _get_recent_transactions(limit: int = 5):
+    """Ambil sedikit riwayat transaksi terakhir untuk ditampilkan di Form.
+    Cache mencegah Google Sheets dibaca ulang setiap kali pengguna mengetik.
+    Riwayat tetap tersedia setelah browser di-refresh karena sumbernya adalah
+    spreadsheet, bukan session_state.
+    """
+    try:
+        _, rows = read_rows_with_index(TAB_TRANSAKSI)
+        rows = list(reversed(rows))
+        return [d for _, d in rows[:limit]]
+    except Exception:
+        return []
+def _render_riwayat_terakhir():
+    recent = _get_recent_transactions(5)
+    with st.expander("🕘 Riwayat perpindahan terakhir", expanded=False):
+        if not recent:
+            st.caption("Belum ada riwayat perpindahan.")
+    return
+    table = []
+    for d in recent:
+        table.append({
+    "ID": d.get("id_transaksi", ""),
+    "Waktu": f"{d.get('tanggal', '')} {d.get('waktu', '')}".strip(),
+    "Pengirim": d.get("nama_pengirim", ""),
+    "Penerima": d.get("nama_penerima", ""),
+    "Perpindahan": f"{d.get('dari_lokasi', '')} → {d.get('ke_lokasi', '')}",
+    "Bundle": d.get("jumlah_bundle", ""),
+    "BAPP": d.get("total_bapp", ""),
+    "Status": d.get("status", ""),
+    })
+    st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+def render_step_form():
+    # PENTING: widget di Streamlit cuma "hidup" selama fungsi yang membuatnya
+    # ikut dijalankan. Karena render_step_form() cuma jalan waktu di step
+    # "form", nilai bawaan widget (key="widget_...") akan HILANG begitu
+    # pindah ke step lain. Makanya setiap nilai yang masih dibutuhkan di step
+    # Summary/Berhasil (nama pengirim, nama penerima, lokasi asal) langsung
+    # disalin ke variabel biasa (awalan "data_") yang tidak ikut terhapus.
+    col1, col2 = st.columns(2)
+    with col1:
+        nama_pengirim = st.text_input(
+    "Nama Pengirim", key="widget_nama_pengirim",
+    value=st.session_state.get("data_nama_pengirim", ""),
+    )
+    with col2:
+        nama_penerima = st.text_input(
+    "Nama Penerima", key="widget_nama_penerima",
+    value=st.session_state.get("data_nama_penerima", ""),
+    )
+    st.session_state.data_nama_pengirim = nama_pengirim
+    st.session_state.data_nama_penerima = nama_penerima
+
+    col3, col4 = st.columns(2)
+    with col3:
+        dari_lokasi = st.selectbox("Dari", options=list(ALUR_LOKASI.keys()), key="widget_form_dari")
+    with col4:
+        ke_lokasi = ALUR_LOKASI[dari_lokasi]
+        st.text_input("Ke", value=ke_lokasi, disabled=True)
+    st.session_state.data_dari_lokasi = dari_lokasi
+
+    # Kalau "Dari" diganti, bundle yang sudah dipilih sebelumnya jadi tidak
+    # relevan lagi (beda lokasi asal) -> kosongkan biar konsisten.
+    if st.session_state._dari_terakhir != dari_lokasi:
+        st.session_state.selected_bundles = []
+        st.session_state._dari_terakhir = dari_lokasi
+
+    st.divider()
+    st.subheader("Pilih Bundle")
+    refresh_col1, refresh_col2 = st.columns([5, 1])
+    with refresh_col2:
+        if st.button("↻", help="Muat ulang data bundle dari Google Sheets", use_container_width=True):
+            _read_master_bundle_cached.clear()
+            _get_recent_transactions.clear()
+            st.rerun()
+
+    direktorat_options = ["Semua Direktorat"] + get_direktorat_options(dari_lokasi)
+    # Kalau lokasi/Direktorat berubah, jangan biarkan nilai filter lama yang
+    # sudah tidak ada di options membuat widget rancu atau menghambat lanjut.
+    if st.session_state.get("direktorat_filter") not in direktorat_options:
+        st.session_state.direktorat_filter = "Semua Direktorat"
+    direktorat_filter = st.selectbox("Direktorat", options=direktorat_options, key="direktorat_filter")
+
+    # ------------------------------------------------------------------
+    # PILIH BUNDLE DARI DAFTAR
+    # ------------------------------------------------------------------
+    # Tidak perlu mengetik nomor bundle satu per satu. Data master sudah
+    # dicache, jadi daftar ini hanya membaca cache yang sama dengan pencarian.
+    sudah_dipilih = {b["nomor_bundle"] for b in st.session_state.selected_bundles}
+
+    semua_bundle = get_bundles_by_lokasi(dari_lokasi)
+    if direktorat_filter != "Semua Direktorat":
+        semua_bundle = [
+            b for b in semua_bundle
+            if b["direktorat"] == direktorat_filter
+        ]
+
+    bundle_tersedia = [
+        b for b in semua_bundle
+        if b["nomor_bundle"] not in sudah_dipilih
+    ]
+
+    if not bundle_tersedia:
+        st.info("Tidak ada bundle yang tersedia untuk lokasi/direktorat ini.")
+    else:
+        st.caption(
+            f"{len(bundle_tersedia):,} bundle tersedia. "
+            "Pilih satu atau beberapa bundle sekaligus dari daftar di bawah."
+        )
+
+        opsi_bundle = {
+            f"{b['nomor_bundle']} — {b['direktorat']} — {b['jumlah_bapp']} BAPP": b
+            for b in bundle_tersedia
+        }
+
+        picker_key = f"bundle_picker_{dari_lokasi}_{direktorat_filter}"
+        pilihan_labels = st.multiselect(
+            "Daftar Bundle yang Mau Dipindahkan",
+            options=list(opsi_bundle.keys()),
+            key=picker_key,
+            placeholder="Klik di sini untuk memilih bundle...",
+        )
+
+        if pilihan_labels and st.button(
+            f"+ Tambahkan {len(pilihan_labels)} Bundle ke Daftar",
+            key="tambah_bundle_dari_daftar",
+            type="primary",
+            use_container_width=True,
+        ):
+            existing = {b["nomor_bundle"] for b in st.session_state.selected_bundles}
+            for label in pilihan_labels:
+                b = opsi_bundle[label]
+                if b["nomor_bundle"] not in existing:
+                    st.session_state.selected_bundles.append({
+                        "nomor_bundle": b["nomor_bundle"],
+                        "direktorat": b["direktorat"],
+                        "jumlah_bapp": b["jumlah_bapp"],
+                    })
+                    existing.add(b["nomor_bundle"])
+            st.session_state.pop(picker_key, None)
+            st.rerun()
+        elif not pilihan_labels:
+            st.caption("Belum ada bundle dari daftar yang dipilih.")
+
+    # Pencarian digit tetap tersedia sebagai opsi cepat untuk bundle tertentu.
+    with st.expander("🔎 Cari berdasarkan nomor bundle (opsional)"):
+        digit_input = st.text_input(
+            "Ketik beberapa digit terakhir",
+            key="digit_search",
+            placeholder="contoh: 125",
+        )
+        if digit_input.strip():
+            hasil = cari_bundle_by_digit(
+                dari_lokasi, direktorat_filter, digit_input, sudah_dipilih
+            )
+            if not hasil:
+                st.info("Bundle tidak ditemukan.")
             else:
-                st.markdown(render_badge("🟢 DITERIMA", "hijau"), unsafe_allow_html=True)
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Nomor Penerimaan**")
-            st.write(info["nomor_penerimaan"])
-            st.markdown("**Tanggal**")
-            st.write(info["waktu"].split(" ")[0] if info["waktu"] else "-")
-        with c2:
-            st.markdown("**Pengirim**")
-            st.write(info["pengirim"] or "-")
-            st.markdown("**Direktorat**")
-            st.markdown(render_badge(info["direktorat"] or "-", "biru"), unsafe_allow_html=True)
-        with c3:
-            st.markdown("**PIC Penerimaan**")
-            st.write(info["pic"] or "-")
-            st.markdown("**Jumlah BAPP**")
-            st.write(info["jumlah"])
-
-        st.markdown("---")
-        st.markdown("#### Daftar BAPP")
-        st.dataframe(tabel, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        if info["status"] == STATUS_OPEN:
-            st.info("Penerimaan ini masih **OPEN** -- print baru tersedia setelah ditutup (semua BAPP ditandai DITERIMA).")
-            if st.button("✏️ Lanjutkan Penerimaan Ini", type="primary"):
-                berhasil, pesan_error = muat_penerimaan_open(nomor)
-                if berhasil:
-                    st.session_state.halaman = "form_baru"
+                opsi_cari = {
+                    f"{b['nomor_bundle']} — {b['direktorat']} — {b['jumlah_bapp']} BAPP": b
+                    for b in hasil[:50]
+                }
+                pilihan_cari = st.selectbox(
+                    "Hasil pencarian",
+                    options=list(opsi_cari.keys()),
+                    key="hasil_cari_bundle",
+                )
+                if st.button("+ Tambahkan Hasil Pencarian", key="tambah_hasil_cari"):
+                    b = opsi_cari[pilihan_cari]
+                    if b["nomor_bundle"] not in {x["nomor_bundle"] for x in st.session_state.selected_bundles}:
+                        st.session_state.selected_bundles.append({
+                            "nomor_bundle": b["nomor_bundle"],
+                            "direktorat": b["direktorat"],
+                            "jumlah_bapp": b["jumlah_bapp"],
+                        })
+                    st.session_state.pop("digit_search", None)
+                    st.session_state.pop("hasil_cari_bundle", None)
                     st.rerun()
-                else:
-                    st.error(pesan_error)
-        else:
-            with st.spinner("Menyiapkan PDF..."):
-                pdf_bytes = buat_pdf_penerimaan(info, tabel)
-            render_tombol_pdf(pdf_bytes, f"BAPP_{info['nomor_penerimaan']}.pdf")
 
+    st.divider()
+    st.subheader("Bundle Terpilih")
 
-# =====================================================================
-# 13. HALAMAN: PENGATURAN
-# =====================================================================
+    if not st.session_state.selected_bundles:
+        st.caption("Belum ada bundle dipilih.")
+    else:
+        by_direktorat = {}
+        for b in st.session_state.selected_bundles:
+            by_direktorat.setdefault(b["direktorat"], []).append(b)
 
-elif st.session_state.halaman == "pengaturan":
-    if st.button("← Kembali ke Daftar Penerimaan"):
-        st.session_state.halaman = "daftar"
+        for direktorat, items in sorted(by_direktorat.items()):
+            st.markdown(f"**{direktorat}**")
+            for b in items:
+                c1, c2 = st.columns([5, 1])
+                c1.write(f"{b['nomor_bundle']} — {b['jumlah_bapp']} BAPP")
+                if c2.button("🗑️", key=f"hapus_{b['nomor_bundle']}"):
+                    st.session_state.selected_bundles = [
+                        x for x in st.session_state.selected_bundles if x["nomor_bundle"] != b["nomor_bundle"]
+                    ]
+                    for k in list(st.session_state.keys()):
+                        if str(k).startswith("bundle_picker_"):
+                            st.session_state.pop(k, None)
+                    st.rerun()
+
+        total_bundle = len(st.session_state.selected_bundles)
+        total_bapp = sum(b["jumlah_bapp"] for b in st.session_state.selected_bundles)
+        st.metric("Total Dipilih", f"{total_bundle} Bundle / {total_bapp} BAPP")
+
+    st.divider()
+    bisa_lanjut = (
+        bool(nama_pengirim.strip())
+        and bool(nama_penerima.strip())
+        and len(st.session_state.selected_bundles) > 0
+    )
+    if not bisa_lanjut:
+        st.caption("Isi Nama Pengirim, Nama Penerima, dan pilih minimal 1 bundle untuk melanjutkan.")
+    if st.button("Lanjut ke Summary ➡️", type="primary", disabled=not bisa_lanjut, use_container_width=True):
+        # Filter pencarian boleh masih terisi. Filter hanya untuk mencari
+        # bundle; filter tidak boleh menghalangi perpindahan ke Summary.
+        st.session_state.submit_error = None
+        st.session_state.wizard_step = "summary"
         st.rerun()
 
-    st.title("⚙️ Pengaturan")
+    _render_riwayat_terakhir()
 
-    st.subheader("Data Master")
-    if st.button("🔄 Refresh Data dari Spreadsheet"):
-        with st.spinner("Memuat ulang data..."):
-            ok = refresh_master_data()
-        if ok:
-            st.success("Data master berhasil diperbarui.")
+def _ringkasan_per_direktorat():
+    by_direktorat = {}
+    for b in st.session_state.selected_bundles:
+        agg = by_direktorat.setdefault(b["direktorat"], {"jumlah_bundle": 0, "total_bapp": 0})
+    agg["jumlah_bundle"] += 1
+    agg["total_bapp"] += b["jumlah_bapp"]
+    return by_direktorat
+def render_step_summary():
+    st.subheader("Ringkasan Perpindahan")
+    st.write(f"**Pengirim** : {st.session_state.data_nama_pengirim}")
+    st.write(f"**Penerima** : {st.session_state.data_nama_penerima}")
+    dari_lokasi = st.session_state.data_dari_lokasi
+    st.write(f"**Dari** : {dari_lokasi}  →  **Ke** : {ALUR_LOKASI[dari_lokasi]}")
+
+    st.divider()
+    for direktorat, agg in sorted(_ringkasan_per_direktorat().items()):
+        st.write(f"**{direktorat}** — {agg['jumlah_bundle']} Bundle | {agg['total_bapp']} BAPP")
+
+    total_bundle = len(st.session_state.selected_bundles)
+    total_bapp = sum(b["jumlah_bapp"] for b in st.session_state.selected_bundles)
+    st.divider()
+    st.metric("TOTAL", f"{total_bundle} Bundle / {total_bapp} BAPP")
+
+    with st.expander("Lihat daftar bundle"):
+        for b in st.session_state.selected_bundles:
+            st.write(f"- {b['nomor_bundle']} ({b['direktorat']}, {b['jumlah_bapp']} BAPP)")
+
+    st.divider()
+    st.subheader("Tanda Tangan Digital")
+    st.caption("Gambar tanda tangan dengan mouse/jari. Ikon tempat sampah di pojok kanvas untuk menghapus & mengulang.")
+
+    versi = st.session_state.canvas_version
+    colX, colY = st.columns(2)
+    with colX:
+        st.write("**Tanda Tangan Pengirim**")
+        canvas_pengirim = st_canvas(
+            stroke_width=2, stroke_color="#000000", background_color="#FFFFFF",
+            height=150, width=280, drawing_mode="freedraw",
+            key=f"canvas_pengirim_{versi}",
+            return_image_data=True,
+        )
+    with colY:
+        st.write("**Tanda Tangan Penerima**")
+        canvas_penerima = st_canvas(
+            stroke_width=2, stroke_color="#000000", background_color="#FFFFFF",
+            height=150, width=280, drawing_mode="freedraw",
+            key=f"canvas_penerima_{versi}",
+            return_image_data=True,
+        )
+
+    # Drawable canvas dapat mengembalikan image_data=None pada rerun tertentu
+    # (terutama di Streamlit Cloud). Karena itu tanda tangan yang sudah berhasil
+    # diterima dari browser disimpan di session_state. Ini membuat tombol Submit
+    # tetap aktif walaupun rerun berikutnya tidak lagi mengirim image_data.
+    current_pengirim = _ambil_image_data_canvas(canvas_pengirim)
+    current_penerima = _ambil_image_data_canvas(canvas_penerima)
+
+    if current_pengirim is not None:
+        if _ada_goresan_ttd(current_pengirim):
+            st.session_state.ttd_pengirim_image = current_pengirim
         else:
-            st.error(f"Gagal mengambil data: {st.session_state.load_error}")
+            # Kanvas benar-benar kosong (misalnya tombol hapus ditekan).
+            st.session_state.ttd_pengirim_image = None
 
-    st.markdown("---")
-    st.subheader("Format Nomor Penerimaan")
-    termin_sekarang = get_setting("termin_penerimaan", "2")
-    termin_baru = st.text_input(
-        "Angka termin penerimaan (contoh: '2' akan menghasilkan SD2-001)", value=termin_sekarang,
-    )
-    if st.button("Simpan Pengaturan"):
-        set_setting("termin_penerimaan", termin_baru.strip())
-        st.success("Pengaturan disimpan. Nomor penerimaan berikutnya akan memakai termin ini.")
-
-    st.markdown("---")
-    st.subheader("Koneksi Spreadsheet")
-    st.write(f"Spreadsheet ID: `{SPREADSHEET_ID}`")
-    st.write(f"Nama Sheet: `{SHEET_NAME}`")
-    st.caption(
-        "Service account harus memiliki akses **Editor** (bukan Viewer) karena "
-        "aplikasi ini menulis balik ke sheet 'data'."
-    )
-    st.caption("Kolom yang wajib ada di sheet 'data': " + ", ".join(KOLOM_WAJIB))
-    if st.button("🔌 Test Koneksi ke Spreadsheet"):
-        with st.spinner("Menguji koneksi..."):
-            ok = refresh_master_data()
-        if ok:
-            st.success("Koneksi berhasil! Data master terbaca dengan baik.")
+    if current_penerima is not None:
+        if _ada_goresan_ttd(current_penerima):
+            st.session_state.ttd_penerima_image = current_penerima
         else:
-            st.error(f"Koneksi gagal: {st.session_state.load_error}")
+            st.session_state.ttd_penerima_image = None
+
+    ttd_pengirim_image = st.session_state.get("ttd_pengirim_image")
+    ttd_penerima_image = st.session_state.get("ttd_penerima_image")
+
+    ttd_pengirim_ok = _ada_goresan_ttd(ttd_pengirim_image)
+    ttd_penerima_ok = _ada_goresan_ttd(ttd_penerima_image)
+
+    status_col1, status_col2 = st.columns(2)
+    with status_col1:
+        if ttd_pengirim_ok:
+            st.success("✓ TTD Pengirim terbaca")
+        else:
+            st.warning("TTD Pengirim belum terbaca")
+    with status_col2:
+        if ttd_penerima_ok:
+            st.success("✓ TTD Penerima terbaca")
+        else:
+            st.warning("TTD Penerima belum terbaca")
+
+    if not (ttd_pengirim_ok and ttd_penerima_ok):
+        st.caption("Tanda tangan Pengirim dan Penerima wajib diisi sebelum submit.")
+
+    if st.session_state.get("submit_error"):
+        st.error(st.session_state.submit_error)
+        st.caption("Tidak ada bundle yang dipindahkan. Periksa pilihan lalu coba Submit lagi.")
+
+    st.divider()
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("⬅️ Kembali", use_container_width=True):
+            st.session_state.wizard_step = "form"
+            st.rerun()
+    with colB:
+        if st.button(
+            "✅ Submit Perpindahan", type="primary", use_container_width=True,
+            disabled=not (ttd_pengirim_ok and ttd_penerima_ok),
+        ):
+            # Penting: JANGAN mengubah lokasi bundle di sini sebelum PDF
+            # berhasil dibuat/upload. Pada versi lama, database dipindahkan
+            # lebih dulu sehingga kegagalan upload bisa membuat status sudah
+            # berpindah walaupun proses terlihat gagal.
+            st.session_state.submit_error = None
+            dari_lokasi = st.session_state.data_dari_lokasi
+            ke_lokasi = ALUR_LOKASI[dari_lokasi]
+            nomor_bundle_list = [b["nomor_bundle"] for b in st.session_state.selected_bundles]
+
+            try:
+                # 1) Validasi kondisi TERBARU dan siapkan ID transaksi, tanpa
+                #    mengubah spreadsheet/master bundle terlebih dahulu.
+                now = datetime.now()
+                _, latest_rows = read_rows_with_index(TAB_MASTER_BUNDLE)
+                by_nomor = {d.get("nomor_bundle"): d for _, d in latest_rows}
+                invalid = [
+                    nb for nb in nomor_bundle_list
+                    if nb not in by_nomor or by_nomor[nb].get("lokasi_saat_ini") != dari_lokasi
+                ]
+                if invalid:
+                    raise ValueError(
+                        "Perpindahan dibatalkan. Bundle berikut sudah tidak berada di "
+                        f"{dari_lokasi}: {', '.join(invalid)}. Kembali ke Form untuk memeriksa ulang."
+                    )
+
+                id_transaksi = generate_id_transaksi(now.date())
+                hasil = {
+                    "id_transaksi": id_transaksi,
+                    "nama_pengirim": st.session_state.data_nama_pengirim,
+                    "nama_penerima": st.session_state.data_nama_penerima,
+                    "dari_lokasi": dari_lokasi,
+                    "ke_lokasi": ke_lokasi,
+                    "by_direktorat": _ringkasan_per_direktorat(),
+                    "detail_bundle": [
+                        {
+                            "nomor_bundle": nb,
+                            "direktorat": by_nomor[nb].get("direktorat", ""),
+                            "jumlah_bapp": int(by_nomor[nb].get("jumlah_bapp") or 0),
+                        }
+                        for nb in nomor_bundle_list
+                    ],
+                    "total_bundle": len(nomor_bundle_list),
+                    "total_bapp": sum(int(by_nomor[nb].get("jumlah_bapp") or 0) for nb in nomor_bundle_list),
+                    "waktu": now,
+                }
+
+                tmp_dir = tempfile.mkdtemp(prefix="ttd_")
+                sig_pengirim_path = os.path.join(tmp_dir, "ttd_pengirim.png")
+                sig_penerima_path = os.path.join(tmp_dir, "ttd_penerima.png")
+                _simpan_ttd_png(ttd_pengirim_image, sig_pengirim_path)
+                _simpan_ttd_png(ttd_penerima_image, sig_penerima_path)
+
+                # 2) Buat PDF dulu.
+                pdf_bytes = generate_pdf_ringkasan(hasil, sig_pengirim_path, sig_penerima_path)
+                hasil["pdf_bytes"] = pdf_bytes
+
+                # 3) Upload PDF dulu. Kalau gagal, MASTER BAPP belum disentuh.
+                drive_folder_id = None
+                drive_folder_url = None
+                if drive_is_enabled():
+                    pdf_path = os.path.join(tmp_dir, f"{id_transaksi}.pdf")
+                    with open(pdf_path, "wb") as f:
+                        f.write(pdf_bytes)
+                    drive_folder_id, drive_folder_url = upload_bukti_transaksi(
+                        id_transaksi, now.date(), [pdf_path]
+                    )
+
+                # 4) BARU setelah PDF aman, commit transaksi + pindahkan
+                #    lokasi bundle. Fungsi ini juga membaca lokasi terbaru lagi
+                #    untuk mencegah double-submit.
+                committed_id, n_bundle, n_bapp = create_transaksi_perpindahan(
+                    dari_lokasi=dari_lokasi,
+                    ke_lokasi=ke_lokasi,
+                    nama_pengirim=st.session_state.data_nama_pengirim.strip(),
+                    nama_penerima=st.session_state.data_nama_penerima.strip(),
+                    nomor_bundle_list=nomor_bundle_list,
+                    drive_folder_id=drive_folder_id,
+                    drive_folder_url=drive_folder_url,
+                    id_transaksi_override=id_transaksi,
+                )
+
+                hasil["id_transaksi"] = committed_id
+                hasil["total_bundle"] = n_bundle
+                hasil["total_bapp"] = n_bapp
+                hasil["drive_folder_url"] = drive_folder_url
+
+                st.session_state.last_result = hasil
+                st.session_state.selected_bundles = []
+                st.session_state.submit_error = None
+                st.session_state.wizard_step = "berhasil"
+                st.rerun()
+
+            except ValueError as e:
+                # Tidak ada perubahan lokasi kalau validasi/commit gagal.
+                st.session_state.submit_error = str(e)
+            except FileNotFoundError as e:
+                st.session_state.submit_error = str(e)
+            except Exception as e:
+                # Jangan tampilkan halaman "berhasil" kalau proses Drive/PDF
+                # gagal. Bundle tetap di lokasi sebelumnya.
+                st.session_state.submit_error = (
+                    "Perpindahan belum dilakukan karena proses PDF/Drive gagal. "
+                    f"Detail: {e}"
+                )
+
+def render_step_berhasil():
+    r = st.session_state.last_result
+    st.success("✓ PERPINDAHAN BERHASIL")
+    st.write(f"**ID Transaksi** : {r['id_transaksi']}")
+    st.write(f"**Pengirim** : {r['nama_pengirim']}")
+    st.write(f"**Penerima** : {r['nama_penerima']}")
+    st.write(f"**Dari** : {r['dari_lokasi']}  →  **Ke** : {r['ke_lokasi']}")
+
+    st.divider()
+    for direktorat, agg in sorted(r["by_direktorat"].items()):
+        st.write(f"**{direktorat}** — {agg['jumlah_bundle']} Bundle | {agg['total_bapp']} BAPP")
+
+    st.divider()
+    st.subheader("Detail Bundle")
+    detail_rows = []
+    for no, bundle in enumerate(r.get("detail_bundle", []), start=1):
+        detail_rows.append({
+            "No": no,
+            "Nomor Bundle": bundle.get("nomor_bundle", ""),
+            "Direktorat": bundle.get("direktorat", ""),
+            "Jumlah BAPP": bundle.get("jumlah_bapp", 0),
+        })
+    if detail_rows:
+        st.dataframe(
+            pd.DataFrame(detail_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("Detail bundle tidak tersedia untuk transaksi ini.")
+
+    st.divider()
+    st.metric("TOTAL", f"{r['total_bundle']} Bundle / {r['total_bapp']} BAPP")
+    st.caption(r["waktu"].strftime("%d %B %Y, %H:%M"))
+
+    st.download_button(
+        "⬇️ Download PDF Ringkasan", data=r["pdf_bytes"],
+        file_name=f"{r['id_transaksi']}.pdf", mime="application/pdf",
+        type="primary", use_container_width=True,
+    )
+
+    if r.get("drive_folder_url"):
+        st.link_button("📂 Buka PDF di Google Drive", r["drive_folder_url"], use_container_width=True)
+
+    if st.button("➕ Buat Perpindahan Baru", use_container_width=True):
+        reset_wizard()
+        st.rerun()
+
+# =============================================================================
+
+# 10. HALAMAN UTAMA
+
+# =============================================================================
+
+st.set_page_config(page_title=APP_TITLE, page_icon="📦")
+init_wizard_state()
+top_col1, top_col2 = st.columns([6, 1])
+with top_col1:
+    st.title(f"📦 {APP_TITLE}")
+with top_col2:
+    with st.popover("⚙️"):
+        st.caption("Pengaturan")
+        if st.button("🔐 Admin / Riwayat PDF", use_container_width=True):
+            st.session_state.show_admin = True
+            st.rerun()
+    st.write(
+        f"Master BAPP: `{MASTER_SHEET_ID[:12]}...`"
+        if MASTER_SHEET_ID
+        else "Master BAPP: belum diatur"
+    )
+    if st.button("🔄 Sinkronisasi Data"):
+        try:
+            with st.spinner("Menyinkronkan..."):
+                hasil = sync_master_bapp()
+            st.success(
+                f"Selesai. {hasil['bundle_baru']} bundle baru ditambahkan "
+                f"(dari {hasil['total_bundle_di_sheet']} total bundle di sheet)."
+            )
+        except FileNotFoundError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Sinkronisasi gagal: {e}")
+
+if st.session_state.get("show_admin", False):
+    if st.button("⬅️ Kembali ke Form", use_container_width=True):
+        st.session_state.show_admin = False
+        st.rerun()
+    render_admin_page()
+else:
+    STEP_RENDERERS = {
+        "form": render_step_form,
+        "summary": render_step_summary,
+        "berhasil": render_step_berhasil,
+    }
+    STEP_RENDERERS[st.session_state.wizard_step]()
