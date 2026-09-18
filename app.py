@@ -1030,6 +1030,7 @@ def render_step_summary():
             stroke_width=2, stroke_color="#000000", background_color="#FFFFFF",
             height=150, width=280, drawing_mode="freedraw",
             key=f"canvas_pengirim_{versi}",
+            return_image_data=True,
         )
     with colY:
         st.write("**Tanda Tangan Penerima**")
@@ -1037,6 +1038,7 @@ def render_step_summary():
             stroke_width=2, stroke_color="#000000", background_color="#FFFFFF",
             height=150, width=280, drawing_mode="freedraw",
             key=f"canvas_penerima_{versi}",
+            return_image_data=True,
         )
 
     # Drawable canvas dapat mengembalikan image_data=None pada rerun tertentu
