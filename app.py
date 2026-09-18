@@ -7,11 +7,12 @@ ringkasan yang sudah ada tanda tangannya). Tidak ada sidebar/menu — cuma
 satu alur form dari atas ke bawah. Sinkronisasi data ada di ikon pengaturan
 (⚙️) di pojok kanan atas.
 
-Cara pakai singkat (detail lengkap di README.md):
-1. pip install -r requirements.txt
-2. Taruh service_account.json di folder yang sama dengan file ini
-3. Lokal: copy .env.example jadi .env. Cloud: isi DB_SHEET_ID, MASTER_SHEET_ID, dan Google credential di Streamlit Secrets
-4. streamlit run app.py
+Cara pakai singkat:
+- Lokal: service_account.json + .env
+- Streamlit Cloud: Google service account disimpan di Streamlit Secrets
+  pada bagian [gcp_service_account], bukan di GitHub.
+- Isi DB_SHEET_ID, MASTER_SHEET_ID, dan bila perlu DRIVE_ROOT_FOLDER_ID.
+- Jalankan: streamlit run app.py
 """
 import io
 import os
@@ -33,8 +34,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from dotenv import load_dotenv
 
+# Catatan deployment:
+# requirements.txt wajib memuat streamlit-drawable-canvas, reportlab, Pillow,
+# gspread, google-auth, google-api-python-client, pandas, numpy, dan python-dotenv.
+
 # =============================================================================
-# 1. KONFIGURASI (dibaca dari file .env)
+# 1. KONFIGURASI (lokal dari .env, Cloud dari Streamlit Secrets)
 # =============================================================================
 load_dotenv()
 
@@ -43,20 +48,6 @@ MASTER_SHEET_ID = os.getenv("MASTER_SHEET_ID", "")
 MASTER_SHEET_WORKSHEET_NAME = os.getenv("MASTER_SHEET_WORKSHEET_NAME", "data")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 DRIVE_ROOT_FOLDER_ID = os.getenv("DRIVE_ROOT_FOLDER_ID", "")
-
-# Credential Google:
-# - Lokal: tetap membaca service_account.json
-# - Streamlit Cloud: membaca [gcp_service_account] dari Streamlit Secrets
-def _get_google_credentials(scopes):
-    if "gcp_service_account" in st.secrets:
-        return Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]),
-            scopes=scopes,
-        )
-    return Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=scopes,
-    )
 
 APP_TITLE = "Form Perpindahan Dokumen BAPP"
 
@@ -138,10 +129,56 @@ SHEETS_SCOPES = [
 # 2. KONEKSI GOOGLE SHEETS (dipakai sebagai "database")
 # =============================================================================
 
+def _get_google_credentials(scopes):
+    """
+    Ambil credential Google dengan dua mode:
+    1. Streamlit Cloud: dari st.secrets["gcp_service_account"].
+    2. Lokal: dari file service_account.json (atau file yang ditentukan
+       GOOGLE_SERVICE_ACCOUNT_FILE).
+
+    Dengan pola ini service_account.json TIDAK perlu di-upload ke GitHub.
+    """
+    try:
+        if "gcp_service_account" in st.secrets:
+            service_account_info = dict(st.secrets["gcp_service_account"])
+
+            # TOML dapat menyimpan private_key dengan \n literal. google-auth
+            # membutuhkan newline yang sebenarnya.
+            if "private_key" in service_account_info:
+                service_account_info["private_key"] = str(
+                    service_account_info["private_key"]
+                ).replace("\\n", "\n")
+
+            return Credentials.from_service_account_info(
+                service_account_info,
+                scopes=scopes,
+            )
+    except Exception as e:
+        raise RuntimeError(
+            "Google credential dari Streamlit Secrets gagal dibaca. "
+            "Pastikan Secrets memiliki blok [gcp_service_account] "
+            "dan field service-account yang lengkap."
+        ) from e
+
+    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            f"File credential tidak ditemukan: {GOOGLE_SERVICE_ACCOUNT_FILE}. "
+            "Untuk Streamlit Cloud, gunakan Settings → Secrets "
+            "dengan blok [gcp_service_account]."
+        )
+
+    return Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=scopes,
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def get_client():
     if not DB_SHEET_ID:
-        raise RuntimeError("DB_SHEET_ID belum diisi di .env")
+        raise RuntimeError(
+            "DB_SHEET_ID belum diisi. Isi di .env (lokal) atau Streamlit Secrets (Cloud)."
+        )
     creds = _get_google_credentials(SHEETS_SCOPES)
     return gspread.authorize(creds)
 
@@ -481,7 +518,7 @@ def _find_or_create_drive_folder(service, name: str, parent_id: str) -> str:
 def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
     """Upload semua file bukti ke PERPINDAHAN DOKUMEN/<tahun>/<bulan>/<id_transaksi>/."""
     if not drive_is_enabled():
-        raise RuntimeError("DRIVE_ROOT_FOLDER_ID belum diisi di .env.")
+        raise RuntimeError("DRIVE_ROOT_FOLDER_ID belum diisi. Isi di .env (lokal) atau Streamlit Secrets (Cloud).")
 
     service = _get_drive_service()
     tahun_id = _find_or_create_drive_folder(service, str(tanggal.year), DRIVE_ROOT_FOLDER_ID)
@@ -503,17 +540,71 @@ def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
 # 7. TANDA TANGAN DIGITAL & PDF RINGKASAN
 # =============================================================================
 
+def _ambil_image_data_canvas(canvas_obj):
+    """
+    Ambil image_data dari st_canvas dengan aman.
+
+    streamlit-drawable-canvas dapat melempar RuntimeError ketika canvas belum
+    mempunyai image_data_url (misalnya pada render awal di Streamlit Cloud).
+    Kondisi tersebut berarti belum ada tanda tangan, bukan berarti aplikasi
+    harus crash.
+    """
+    if canvas_obj is None:
+        return None
+
+    try:
+        image_data = canvas_obj.image_data
+    except (RuntimeError, AttributeError, KeyError, TypeError):
+        return None
+    except Exception:
+        # Jangan biarkan error internal widget merusak seluruh halaman.
+        return None
+
+    if image_data is None:
+        return None
+
+    try:
+        arr = np.asarray(image_data)
+    except Exception:
+        return None
+
+    if arr.size == 0 or arr.ndim < 2:
+        return None
+
+    return arr
+
+
 def _ada_goresan_ttd(image_data) -> bool:
     """Cek apakah kanvas tanda tangan sudah digambar (bukan cuma kanvas putih
     kosong). image_data adalah array RGBA dari st_canvas."""
     if image_data is None:
         return False
-    rgb = np.array(image_data)[:, :, :3]
-    return bool(np.any(rgb != 255))
+
+    try:
+        arr = np.asarray(image_data)
+        if arr.size == 0 or arr.ndim < 2:
+            return False
+
+        rgb = arr[:, :, :3]
+        return bool(np.any(rgb != 255))
+    except Exception:
+        return False
 
 
 def _simpan_ttd_png(image_data, path: str):
-    img = Image.fromarray(np.array(image_data).astype("uint8"), "RGBA")
+    if image_data is None:
+        raise ValueError("Data tanda tangan kosong.")
+
+    arr = np.asarray(image_data)
+    if arr.size == 0 or arr.ndim < 2:
+        raise ValueError("Data tanda tangan tidak valid.")
+
+    # Pastikan RGBA. Beberapa versi widget bisa menghasilkan RGB.
+    if arr.shape[2] == 3:
+        alpha = np.full(arr.shape[:2] + (1,), 255, dtype=arr.dtype)
+        arr = np.concatenate([arr, alpha], axis=2)
+
+    img = Image.fromarray(arr.astype("uint8"), "RGBA")
     # Tempel di atas latar putih supaya tidak transparan saat dimasukkan ke PDF.
     background = Image.new("RGB", img.size, (255, 255, 255))
     background.paste(img, mask=img.split()[3])
@@ -598,9 +689,6 @@ def init_wizard_state():
         "_dari_terakhir": "Tim Gate",
         "data_nama_pengirim": "",
         "data_nama_penerima": "",
-        # Alias kompatibilitas untuk kode lama
-        "nama_pengirim": "",
-        "nama_penerima": "",
         "last_result": None,
         "canvas_version": 0,
     }
@@ -787,8 +875,13 @@ def render_step_summary():
             key=f"canvas_penerima_{versi}",
         )
 
-    ttd_pengirim_ok = _ada_goresan_ttd(canvas_pengirim.image_data if canvas_pengirim else None)
-    ttd_penerima_ok = _ada_goresan_ttd(canvas_penerima.image_data if canvas_penerima else None)
+    # Jangan akses .image_data secara langsung. Library drawable-canvas dapat
+    # melempar RuntimeError saat image_data_url belum tersedia.
+    ttd_pengirim_image = _ambil_image_data_canvas(canvas_pengirim)
+    ttd_penerima_image = _ambil_image_data_canvas(canvas_penerima)
+
+    ttd_pengirim_ok = _ada_goresan_ttd(ttd_pengirim_image)
+    ttd_penerima_ok = _ada_goresan_ttd(ttd_penerima_image)
     if not (ttd_pengirim_ok and ttd_penerima_ok):
         st.caption("Tanda tangan Pengirim dan Penerima wajib diisi sebelum submit.")
 
@@ -831,8 +924,10 @@ def render_step_summary():
                 tmp_dir = tempfile.mkdtemp(prefix="ttd_")
                 sig_pengirim_path = os.path.join(tmp_dir, "ttd_pengirim.png")
                 sig_penerima_path = os.path.join(tmp_dir, "ttd_penerima.png")
-                _simpan_ttd_png(canvas_pengirim.image_data, sig_pengirim_path)
-                _simpan_ttd_png(canvas_penerima.image_data, sig_penerima_path)
+                # Gunakan image_data yang sudah dibaca aman di atas, bukan
+                # mengakses canvas.image_data lagi saat proses submit.
+                _simpan_ttd_png(ttd_pengirim_image, sig_pengirim_path)
+                _simpan_ttd_png(ttd_penerima_image, sig_penerima_path)
 
                 pdf_bytes = generate_pdf_ringkasan(hasil, sig_pengirim_path, sig_penerima_path)
                 hasil["pdf_bytes"] = pdf_bytes
@@ -856,6 +951,13 @@ def render_step_summary():
                 st.rerun()
             except ValueError as e:
                 st.error(str(e))
+            except FileNotFoundError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(
+                    "Perpindahan gagal diproses. "
+                    f"Detail: {e}"
+                )
 
 
 def render_step_berhasil():
@@ -910,8 +1012,8 @@ with top_col2:
                     f"Selesai. {hasil['bundle_baru']} bundle baru ditambahkan "
                     f"(dari {hasil['total_bundle_di_sheet']} total bundle di sheet)."
                 )
-            except FileNotFoundError:
-                st.error("File service_account.json tidak ditemukan.")
+            except FileNotFoundError as e:
+                st.error(str(e))
             except Exception as e:
                 st.error(f"Sinkronisasi gagal: {e}")
 
