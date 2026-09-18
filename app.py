@@ -30,6 +30,9 @@ from reportlab.pdfgen import canvas as pdfcanvas
 from streamlit_drawable_canvas import st_canvas
 from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request
+from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from dotenv import load_dotenv
@@ -46,16 +49,38 @@ load_dotenv()
 # Streamlit Cloud memakai st.secrets, sedangkan lokal memakai .env.
 # Nilai dari Secrets diprioritaskan jika tersedia.
 def _setting(name: str, default: str = "") -> str:
+    """Ambil setting dari env atau Streamlit Secrets.
+
+    Selain top-level, fungsi ini juga mencari satu key di dalam tabel Secrets.
+    Ini membantu jika ADMIN_PASSWORD/DRIVE_ROOT_FOLDER_ID tidak sengaja
+    ditempatkan di bawah [gcp_service_account].
+    """
     value = os.getenv(name, default)
+
+    def find_nested(obj):
+        try:
+            if isinstance(obj, dict):
+                if name in obj and obj[name] not in (None, ""):
+                    return str(obj[name]).strip()
+                for child in obj.values():
+                    found = find_nested(child)
+                    if found:
+                        return found
+        except Exception:
+            pass
+        return ""
+
     try:
         secret_value = st.secrets.get(name, None)
-        if secret_value is not None:
-            # Jangan menganggap string kosong sebagai konfigurasi aktif.
-            secret_value = str(secret_value).strip()
-            if secret_value:
-                value = secret_value
+        if secret_value not in (None, ""):
+            value = str(secret_value).strip()
+        else:
+            nested_value = find_nested(dict(st.secrets))
+            if nested_value:
+                value = nested_value
     except Exception:
         pass
+
     return str(value or "").strip()
 
 
@@ -513,9 +538,39 @@ def drive_is_enabled() -> bool:
 
 
 def _get_drive_service():
-    creds = _get_google_credentials(
-        ["https://www.googleapis.com/auth/drive"]
-    )
+    """Buat client Drive.
+
+    Prioritas: OAuth akun Google manusia (untuk My Drive), lalu service
+    account (cocok untuk Shared Drive). Service account tidak memiliki
+    storage quota untuk memiliki file sendiri.
+    """
+    drive_scope = ["https://www.googleapis.com/auth/drive"]
+
+    try:
+        oauth_cfg = st.secrets.get("google_drive_oauth", None)
+        if oauth_cfg:
+            cfg = dict(oauth_cfg)
+            client_id = str(cfg.get("client_id", "")).strip()
+            client_secret = str(cfg.get("client_secret", "")).strip()
+            refresh_token = str(cfg.get("refresh_token", "")).strip()
+            if client_id and client_secret and refresh_token:
+                creds = UserCredentials(
+                    token=None,
+                    refresh_token=refresh_token,
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    scopes=drive_scope,
+                )
+                creds.refresh(Request())
+                return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        raise RuntimeError(
+            "Google Drive OAuth gagal. Periksa bagian [google_drive_oauth] "
+            "di Streamlit Secrets (client_id, client_secret, refresh_token)."
+        ) from e
+
+    creds = _get_google_credentials(drive_scope)
     return build("drive", "v3", credentials=creds)
 
 
@@ -524,12 +579,19 @@ def _find_or_create_drive_folder(service, name: str, parent_id: str) -> str:
         f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' "
         f"and '{parent_id}' in parents and trashed = false"
     )
-    res = service.files().list(q=query, fields="files(id, name)").execute()
+    res = service.files().list(
+        q=query,
+        fields="files(id, name, driveId)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
     files = res.get("files", [])
     if files:
         return files[0]["id"]
     metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    folder = service.files().create(body=metadata, fields="id").execute()
+    folder = service.files().create(
+        body=metadata, fields="id", supportsAllDrives=True
+    ).execute()
     return folder["id"]
 
 
@@ -547,7 +609,8 @@ def _grant_admin_drive_access(service, folder_id: str):
     try:
         existing = service.permissions().list(
             fileId=folder_id,
-            fields="permissions(id,emailAddress,type,role)"
+            fields="permissions(id,emailAddress,type,role)",
+            supportsAllDrives=True,
         ).execute().get("permissions", [])
         if any(
             p.get("type") == "user"
@@ -563,7 +626,28 @@ def _grant_admin_drive_access(service, folder_id: str):
         fileId=folder_id,
         body={"type": "user", "role": "reader", "emailAddress": ADMIN_EMAIL},
         sendNotificationEmail=False,
+        supportsAllDrives=True,
     ).execute()
+
+
+def _check_drive_root(service):
+    """Validasi root folder dan beri pesan jelas bila service account diarahkan ke My Drive."""
+    try:
+        info = service.files().get(
+            fileId=DRIVE_ROOT_FOLDER_ID,
+            fields="id,name,mimeType,driveId,capabilities(canAddChildren)",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as e:
+        raise RuntimeError(
+            "DRIVE_ROOT_FOLDER_ID tidak bisa diakses oleh akun Google yang dipakai aplikasi. "
+            "Pastikan folder dibagikan ke akun tersebut dan ID folder benar. Detail: " + str(e)
+        ) from e
+
+    if info.get("mimeType") != "application/vnd.google-apps.folder":
+        raise RuntimeError("DRIVE_ROOT_FOLDER_ID bukan ID folder Google Drive.")
+
+    return info
 
 
 def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
@@ -572,6 +656,7 @@ def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
         raise RuntimeError("DRIVE_ROOT_FOLDER_ID belum diisi. Isi di .env (lokal) atau Streamlit Secrets (Cloud).")
 
     service = _get_drive_service()
+    _check_drive_root(service)
     tahun_id = _find_or_create_drive_folder(service, str(tanggal.year), DRIVE_ROOT_FOLDER_ID)
     bulan_id = _find_or_create_drive_folder(service, f"{tanggal.month:02d}", tahun_id)
     transaksi_folder_id = _find_or_create_drive_folder(service, id_transaksi, bulan_id)
@@ -581,7 +666,7 @@ def upload_bukti_transaksi(id_transaksi: str, tanggal, local_file_paths: list):
         media = MediaFileUpload(path, resumable=True)
         service.files().create(
             body={"name": os.path.basename(path), "parents": [transaksi_folder_id]},
-            media_body=media, fields="id",
+            media_body=media, fields="id", supportsAllDrives=True,
         ).execute()
 
     folder_url = f"https://drive.google.com/drive/folders/{transaksi_folder_id}"
@@ -757,6 +842,10 @@ def render_admin_page():
         st.error(
             "Akses admin belum dikonfigurasi. Tambahkan ADMIN_PASSWORD di "
             "Streamlit Secrets (atau .env untuk lokal)."
+        )
+        st.info(
+            "Pastikan ADMIN_PASSWORD berada di level utama Secrets, misalnya "
+            'ADMIN_PASSWORD = "password-kamu". Jangan menaruhnya di bawah [gcp_service_account].'
         )
         return
 
